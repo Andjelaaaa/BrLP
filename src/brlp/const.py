@@ -62,13 +62,21 @@ COARSE_REGIONS = [
 CONDITIONING_VARIABLES = [
     "age", 
     "sex",
-    "diagnosis",
+    # "diagnosis",
     "cerebral_cortex", 
     "hippocampus", 
     "amygdala",
     "cerebral_white_matter",
     "lateral_ventricle", 
 ]
+
+# CONDITIONING_REGIONS = [
+#     "cerebral_cortex", 
+#     "hippocampus", 
+#     "amygdala",
+#     "cerebral_white_matter",
+#     "lateral_ventricle", 
+# ]
 
 CONDITIONING_REGIONS = [
     "cerebral_cortex", 
@@ -79,16 +87,21 @@ CONDITIONING_REGIONS = [
 ]
 
 # choosen resolution
-RESOLUTION = 1.5                                
+# RESOLUTION = 1.5   
+RESOLUTION = 1.3                             
 
 # shape of the MNI152 (1mm^3) template
-INPUT_SHAPE_1mm = (182, 218, 182)   
+# INPUT_SHAPE_1mm = (182, 218, 182)   
+INPUT_SHAPE_1mm = (135, 177, 138)   
 
 # resampling the MNI152 to (1.5mm^3)
-INPUT_SHAPE_1p5mm = (122, 146, 122)   
+# INPUT_SHAPE_1p5mm = (122, 146, 122) 
+# resampling the template to (1.3mm^3)
+INPUT_SHAPE_1p5mm = (104, 136, 106)   
 
 # Adjusting the dimensions to be divisible by 8 (2^3 where 3 are the downsampling layers of the AE)
-INPUT_SHAPE_AE = (120, 144, 120)   
+# INPUT_SHAPE_AE = (120, 144, 120)  
+INPUT_SHAPE_AE = (112, 144, 112)  
 
 # Latent shape of the autoencoder 
 LATENT_SHAPE_AE = (3, 15, 18, 15)   
@@ -96,14 +109,23 @@ LATENT_SHAPE_AE = (3, 15, 18, 15)
 # Adjusting the latent space (with constant padding) to be divisible by 4 (2^2 where 2 are the downsampling layers of U-Net)
 LATENT_SHAPE_DM = (3, 16, 20, 16)   
 
-# Affine matrix for MNI space resampled to 1.5mm^3
+# # Affine matrix for MNI space resampled to 1.5mm^3
+# MNI152_1P5MM_AFFINE = np.array([         
+#     [ -1.5, 0,    0,    90   ],
+#     [ 0,    1.5,  0,    -126 ],
+#     [ 0,    0,    1.5,  -72  ],
+#     [ 0,    0,     0,   1    ]
+# ])
+
+# Affine matrix for ANTS 0-8 resampled to 1.3mm^3
 MNI152_1P5MM_AFFINE = np.array([         
-    [ -1.5, 0,    0,    90   ],
-    [ 0,    1.5,  0,    -126 ],
-    [ 0,    0,    1.5,  -72  ],
+    [ -1.3, 0,    0,    65   ],
+    [ 0,    1.3,  0,    -105 ],
+    [ 0,    0,    1.3,  -56  ],
     [ 0,    0,     0,   1    ]
 ])
 
-AGE_MIN, AGE_MAX, AGE_DELTA = 0, 100, 100
+# AGE_MIN, AGE_MAX, AGE_DELTA = 0, 100, 100
+AGE_MIN, AGE_MAX, AGE_DELTA = 1, 7, 6
 SEX_MIN, SEX_MAX, SEX_DELTA = 1, 2, 1
-DIA_MIN, DIA_MAX, DIA_DELTA = 1, 3, 2
+# DIA_MIN, DIA_MAX, DIA_DELTA = 1, 3, 2

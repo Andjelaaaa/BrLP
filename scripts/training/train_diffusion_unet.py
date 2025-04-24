@@ -1,5 +1,6 @@
 import os
 import argparse
+import csv
 
 import torch
 import torch.nn.functional as F
@@ -50,15 +51,25 @@ def images_to_tensorboard(
 
     for tag_i, size in enumerate([ 'small', 'medium', 'large' ]):
 
+        # context = torch.tensor([[
+        #     (torch.randint(60, 99, (1,)) - const.AGE_MIN) / const.AGE_DELTA,  # age 
+        #     (torch.randint(1, 2,   (1,)) - const.SEX_MIN) / const.SEX_DELTA,  # sex
+        #     (torch.randint(1, 3,   (1,)) - const.DIA_MIN) / const.DIA_DELTA,  # diagnosis
+        #     0.567, # (mean) cerebral cortex 
+        #     0.539, # (mean) hippocampus
+        #     0.578, # (mean) amygdala
+        #     0.558, # (mean) cerebral white matter
+        #     0.30 * (tag_i+1), # variable size lateral ventricles
+        # ]])
+
         context = torch.tensor([[
-            (torch.randint(60, 99, (1,)) - const.AGE_MIN) / const.AGE_DELTA,  # age 
+            (torch.randint(1, 7, (1,)) - const.AGE_MIN) / const.AGE_DELTA,  # age 
             (torch.randint(1, 2,   (1,)) - const.SEX_MIN) / const.SEX_DELTA,  # sex
-            (torch.randint(1, 3,   (1,)) - const.DIA_MIN) / const.DIA_DELTA,  # diagnosis
-            0.567, # (mean) cerebral cortex 
-            0.539, # (mean) hippocampus
-            0.578, # (mean) amygdala
-            0.558, # (mean) cerebral white matter
-            0.30 * (tag_i+1), # variable size lateral ventricles
+            0.573, # (mean) cerebral cortex 
+            0.513, # (mean) hippocampus
+            0.508, # (mean) amygdala
+            0.474, # (mean) cerebral white matter
+            0.155 * (tag_i+1), # variable size lateral ventricles
         ]])
 
         image = sample_using_diffusion(
@@ -137,7 +148,8 @@ if __name__ == '__main__':
     with torch.no_grad():
         with autocast(enabled=True):
             z = trainset[0]['latent']
-            
+    print(f"Latent shape: {z.shape}")
+
     scale_factor = 1 / torch.std(z)
     print(f"Scaling factor set to {scale_factor}")
 
@@ -147,8 +159,14 @@ if __name__ == '__main__':
     loaders         = { 'train': train_loader, 'valid': valid_loader }
     datasets        = { 'train': trainset, 'valid': validset }
 
+    all_losses = []
+
+
     for epoch in range(args.n_epochs):
-        
+
+        epoch_losses = {}
+        epoch_steps = {}
+
         for mode in loaders.keys():
             
             loader = loaders[mode]
@@ -194,6 +212,10 @@ if __name__ == '__main__':
         
             # end of epoch
             epoch_loss = epoch_loss / len(loader)
+
+            epoch_losses[mode] = epoch_loss
+            epoch_steps[mode] = len(loader)
+
             writer.add_scalar(f'{mode}/epoch-mse', epoch_loss, epoch)
 
             # visualize results
@@ -206,6 +228,24 @@ if __name__ == '__main__':
                 scale_factor=scale_factor
             )
 
+        all_losses.append({
+        'epoch': epoch,
+        'train_loss': epoch_losses.get('train'),
+        'train_steps': epoch_steps.get('train'),
+        'valid_loss': epoch_losses.get('valid'),
+        'valid_steps': epoch_steps.get('valid'),
+        })
+
         # save the model                
         savepath = os.path.join(args.output_dir, f'unet-ep-{epoch}.pth')
         torch.save(diffusion.state_dict(), savepath)
+
+        #save csv
+        csv_path = os.path.join(args.output_dir, "epoch_losses.csv")
+        write_header = epoch == 0
+        with open(csv_path, mode="a", newline="") as f:
+            fieldnames = ["epoch", "train_loss", "train_steps", "valid_loss", "valid_steps"]
+            csv_writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                csv_writer.writeheader()
+            csv_writer.writerow(all_losses[-1])

@@ -37,8 +37,32 @@ def make_csv_A(df):
         # normalize volumes using min-max scaling
         train_values = csv_a_df[ csv_a_df.split == 'train' ][region]
         minv, maxv = train_values.min(), train_values.max()
+        print(f'For Region: {region}')
+        print(f'min: {minv}, max: {maxv}')
+        print(f'mean: {train_values.mean()}, std: {train_values.std()}')
+        print(f'median: {train_values.median()}')
         csv_a_df[region] = (csv_a_df[region] - minv) / (maxv - minv)
     
+    print('FOR CSV A: \n')
+    for region in coarse_regions:
+        # Extract training values for the region
+        train_values = csv_a_df[csv_a_df.split == 'train'][region]
+
+        # Compute statistics
+        minv = train_values.min()
+        maxv = train_values.max()
+        meanv = train_values.mean()
+        stdv = train_values.std()
+        medianv = train_values.median()
+
+        # Print region stats
+        print(f"For Region: {region}")
+        print(f"  min:    {minv:.3f}")
+        print(f"  max:    {maxv:.3f}")
+        print(f"  mean:   {meanv:.3f}")
+        print(f"  std:    {stdv:.3f}")
+        print(f"  median: {medianv:.3f}")
+
     return csv_a_df
 
 
@@ -70,7 +94,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset_csv',      type=str, required=True)
     parser.add_argument('--output_path',      type=str, required=True)
-    parser.add_argument('--coarse_regions',   type=str, required=True)
+    # parser.add_argument('--coarse_regions',   type=str, required=True)
     
     args = parser.parse_args()
 
@@ -80,9 +104,9 @@ if __name__ == '__main__':
     print()
     print('> Creating CSV A\n')
     csv_A = make_csv_A(df)
-    csv_A.to_csv(os.path.join(args.output_path, 'A.csv'), index=False)
+    # csv_A.to_csv(os.path.join(args.output_path, 'A.csv'), index=False)
 
-    print()
-    print('> Creating CSV B\n')
-    csv_B = make_csv_B(csv_A)
-    csv_B.to_csv(os.path.join(args.output_path, 'B.csv'), index=False)
+    # print()
+    # print('> Creating CSV B\n')
+    # csv_B = make_csv_B(csv_A)
+    # csv_B.to_csv(os.path.join(args.output_path, 'B.csv'), index=False)

@@ -36,7 +36,7 @@ def concat_covariates(_dict):
     conditions = [
         _dict['followup_age'], 
         _dict['sex'], 
-        _dict['followup_diagnosis'], 
+        # _dict['followup_diagnosis'], 
         _dict['followup_cerebral_cortex'], 
         _dict['followup_hippocampus'], 
         _dict['followup_amygdala'], 
@@ -60,7 +60,8 @@ def images_to_tensorboard(
     """
     Visualize the generation on tensorboard
     """
-    resample_fn = transforms.Spacing(pixdim=1.5)
+    # resample_fn = transforms.Spacing(pixdim=1.5)
+    resample_fn = transforms.Spacing(pixdim=1.3)
     random_indices = np.random.choice( range(len(dataset)), 3 ) 
 
     for tag_i, i in enumerate(random_indices):
@@ -69,8 +70,8 @@ def images_to_tensorboard(
         context    = dataset[i]['context']
         starting_a = dataset[i]['starting_age']
 
-        starting_image = torch.from_numpy(nib.load(dataset[i]['starting_image']).get_fdata()).unsqueeze(0)
-        followup_image = torch.from_numpy(nib.load(dataset[i]['followup_image']).get_fdata()).unsqueeze(0)
+        starting_image = torch.from_numpy(nib.load(dataset[i]['starting_image_path']).get_fdata()).unsqueeze(0)
+        followup_image = torch.from_numpy(nib.load(dataset[i]['followup_image_path']).get_fdata()).unsqueeze(0)
         starting_image = resample_fn(starting_image).squeeze(0)
         followup_image = resample_fn(followup_image).squeeze(0)
 
@@ -114,6 +115,9 @@ if __name__ == '__main__':
 
     npz_reader = NumpyReader(npz_keys=['data'])
     transforms_fn = transforms.Compose([
+        transforms.CopyItemsD(
+        keys=['starting_latent_path', 'followup_latent_path'],
+        names=['starting_latent', 'followup_latent']),
         transforms.LoadImageD(keys=['starting_latent', 'followup_latent'], reader=npz_reader), 
         transforms.EnsureChannelFirstD(keys=['starting_latent', 'followup_latent'], channel_dim=0), 
         transforms.DivisiblePadD(keys=['starting_latent', 'followup_latent'], k=4, mode='constant'), 
@@ -121,6 +125,7 @@ if __name__ == '__main__':
     ])
 
     dataset_df = pd.read_csv(args.dataset_csv)
+    print("Available columns:", dataset_df.columns.tolist())
     train_df = dataset_df[ dataset_df.split == 'train' ]
     valid_df = dataset_df[ dataset_df.split == 'valid' ]
     trainset = get_dataset_from_pd(train_df, transforms_fn, args.cache_dir)
@@ -202,6 +207,7 @@ if __name__ == '__main__':
                     starting_z = batch['starting_latent'].to(DEVICE)  * scale_factor
                     followup_z = batch['followup_latent'].to(DEVICE)  * scale_factor
                     context    = batch['context'].to(DEVICE)
+                    print(f"[DEBUG] context shape at step {step} ({mode}): {context.shape}")
                     starting_a = batch['starting_age'].to(DEVICE)
 
                     n = starting_z.shape[0] 
