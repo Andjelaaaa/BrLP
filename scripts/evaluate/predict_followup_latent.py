@@ -287,17 +287,23 @@ from collections import defaultdict
 from monai import transforms
 import matplotlib.pyplot as plt
 from brlp import init_autoencoder, const
+from sklearn.metrics.pairwise import cosine_similarity
 
 ################################################################################
 # CONFIG
 ################################################################################
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-import os
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-import torch
+
+
+def compute_cosine_and_norm_similarity(v1, v2):
+    v1 = np.asarray(v1, dtype=np.float32)
+    v2 = np.asarray(v2, dtype=np.float32)
+
+    cos_sim = cosine_similarity(v1.reshape(1, -1), v2.reshape(1, -1)).item()
+    norm_sim = min(np.linalg.norm(v1), np.linalg.norm(v2)) / max(np.linalg.norm(v1), np.linalg.norm(v2))
+    return cos_sim, norm_sim
+
 
 def sweep_rbf_hyperparameter(
     param_values,
@@ -334,6 +340,9 @@ def sweep_rbf_hyperparameter(
     mean_l2_errors = []
     mean_mse_errors = []
     mean_error_diffs = []
+    mean_cosine_similarities = []
+    mean_norm_similarities = []
+    mean_final_similarities = []
 
     for val in param_values:
         print(f"\n=== Training RBF with {param_name}={val} ===")
@@ -371,11 +380,17 @@ def sweep_rbf_hyperparameter(
                 true_follow_latent = row_follow[[col for col in test_df.columns if col.startswith("latent_")]].to_numpy()
 
                 delta_pred = rbf(start_latent[np.newaxis, :])[0]
-                predicted_latent = start_latent + delta_pred * delta_t
+                trajectory_true = true_follow_latent - start_latent
+                trajectory_pred = delta_pred * delta_t
+                predicted_latent = start_latent + trajectory_pred
 
                 l2 = np.linalg.norm(predicted_latent - true_follow_latent)
-                error_diff = l2 - np.linalg.norm(true_follow_latent - start_latent)
+                #error diff should be normalized
+                error_diff = l2 - np.linalg.norm(trajectory_true)
                 mse = np.mean((predicted_latent - true_follow_latent) ** 2)
+
+                cos_sim, norm_sim = compute_cosine_and_norm_similarity(trajectory_pred, trajectory_true)
+                final_sim = cos_sim * norm_sim
 
                 errors.append({
                     "subject_id": subject_id,
@@ -385,11 +400,14 @@ def sweep_rbf_hyperparameter(
                     "l2_error": l2,
                     "error_diff": error_diff,
                     "mse": mse,
+                    "cosine_similarity": cos_sim,
+                    "norm_similarity": norm_sim,
+                    "final_similarity": final_sim,
                     "predicted_latent": predicted_latent,
                     "true_followup_latent": true_follow_latent
                 })
 
-        # error_df = pd.DataFrame(errors)
+        error_df = pd.DataFrame(errors)
         # mean_l2_errors.append(error_df["l2_error"].mean())
         # mean_error_diffs.append(error_df["error_diff"].mean())
 
@@ -398,25 +416,40 @@ def sweep_rbf_hyperparameter(
         error_diffs = [e["error_diff"] for e in errors]
 
         # Save mean values
-        mean_l2_errors.append(np.mean([e["l2_error"] for e in errors]))
-        mean_mse_errors.append(np.mean([e["mse"] for e in errors]))
-        mean_error_diffs.append(np.mean(error_diffs))
+        mean_l2_errors.append(error_df["l2_error"].mean())
+        mean_mse_errors.append(error_df["mse"].mean())
+        mean_error_diffs.append(error_df["error_diff"].mean())
+        mean_cosine_similarities.append(error_df["cosine_similarity"].mean())
+        mean_norm_similarities.append(error_df["norm_similarity"].mean())
+        mean_final_similarities.append(error_df["final_similarity"].mean())
 
-        print(f"✅ {param_name}={val} | Mean L2 Error: {mean_l2_errors[-1]:.4f} | Mean MSE: {mean_mse_errors[-1]:.4f} | Mean Error Diff: {mean_error_diffs[-1]:.4f}")
+        print(f"✅ {param_name}={val} | Mean L2 Error: {mean_l2_errors[-1]:.4f} | Mean MSE: {mean_mse_errors[-1]:.4f} | Mean Error Diff: {mean_error_diffs[-1]:.4f} | Mean CosSim: {mean_cosine_similarities[-1]:.4f} | Mean NormSim: {mean_norm_similarities[-1]:.4f}")
+
 
         # === Per delta_t scatter plot ===
         plt.figure(figsize=(8, 6))
-        plt.scatter(delta_times, error_diffs, alpha=0.7)
-        plt.axhline(0, color='red', linestyle='--', label="No Improvement Line")
+
+        # plt.scatter(delta_times, [e["error_diff"] for e in errors], alpha=0.7, label="Error Diff (L2 - norm(traject_true))", marker='s')
+
+        plt.scatter(delta_times, [e["norm_similarity"] for e in errors], alpha=0.7, label="Norm sim (traject_true vs pred)", marker='o')
+
+        plt.scatter(delta_times, [e["cosine_similarity"] for e in errors], alpha=0.7, label="cosine sim (traject_true vs pred)", marker='*')
+
+        plt.scatter(delta_times, [e["final_similarity"] for e in errors], alpha=0.7, label="final sim (cos*norm)", marker='^')
+        # Horizontal reference line
+        plt.axhline(0, color='red', linestyle='--', label="Zero Reference")
+        # Labels and styling
         plt.xlabel("Δ Time (years)")
-        plt.ylabel("Error Diff (L2 - norm(∆t))")
-        plt.title(f"Error Diff vs Delta Time\n({param_name}={val:.0e})")
+        plt.ylabel("Error Metric Value")
+        plt.title(f"Error Metrics vs Delta Time\n({param_name}={val:.0e})")
         plt.grid(True)
         plt.legend()
+        # Save figure
         os.makedirs(f"{save_prefix}/scatter_plots", exist_ok=True)
         scatter_path = f"{save_prefix}/scatter_plots/scatter_{param_name}_{val:.0e}.png".replace("-", "m")
         plt.savefig(scatter_path, dpi=150)
         plt.close()
+
         print(f"✅ Saved scatter plot {scatter_path}")
         
         # Plot best and worst samples
@@ -452,9 +485,12 @@ def sweep_rbf_hyperparameter(
 
     # === Plot Mean Errors
     plt.figure(figsize=(10, 5))
-    plt.plot(param_values, mean_l2_errors, marker='o', label="Mean L2 Error")
+    # plt.plot(param_values, mean_l2_errors, marker='o', label="Mean L2 Error")
     plt.plot(param_values, mean_error_diffs, marker='s', label="Mean Error Diff")
     plt.plot(param_values, mean_mse_errors, marker='s', label="Mean MSE")
+    plt.plot(param_values, mean_cosine_similarities, marker='s', label="Mean cosine sim")
+    plt.plot(param_values, mean_norm_similarities, marker='s', label="Mean norm sim")
+    plt.plot(param_values, mean_final_similarities, marker='s', label="Mean final sim (cos*norm)")
     plt.xscale('log')
     plt.xlabel(param_name.capitalize())
     plt.ylabel("Error")
@@ -764,7 +800,7 @@ if __name__ == "__main__":
 
 
     # sweep_rbf_hyperparameter(
-    #     param_values=[0.5, 1.0, 2.0, 5.0, 10.0],
+    #     param_values=[0.001, 0.01, 0.02, 0.1, 0.2],
     #     param_name="epsilon",
     #     start_latents=start_latents,
     #     delta_vectors=delta_vectors,
