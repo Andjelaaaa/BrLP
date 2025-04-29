@@ -125,7 +125,7 @@ def sample_using_controlnet_and_z(
     Returns:
         torch.Tensor: the inferred follow-up MRI
     """
-    print(f"[DEBUG] initial context shape: {context.shape}")
+    # print(f"[DEBUG] initial context shape: {context.shape}")
 
     # Using DDIM sampling from (Song et al., 2020) allowing for a 
     # deterministic reverse diffusion process (except for the starting noise)
@@ -176,7 +176,7 @@ def sample_using_controlnet_and_z(
                 # convert the timestep to a tensor.
                 timestep = torch.tensor([t]).repeat(average_over_n).to(device)
 
-                print(f"[DEBUG] context shape before controlnet: {context.shape}")
+                # print(f"[DEBUG] context shape before controlnet: {context.shape}")
 
                 # get the intermediate features from the ControlNet
                 # by feeding the starting latent, the covariates and the timestep

@@ -137,7 +137,7 @@ def tb_display_generation(writer, step, tag, image):
     writer.add_figure(tag, plt.gcf(), global_step=step)
 
 
-def tb_display_cond_generation(writer, step, tag, starting_image, followup_image, predicted_image):
+def tb_display_cond_generation(writer, step, starting_a, tag, starting_image, followup_image, predicted_image):
     """
     Display conditional generation result in TensorBoard during ControlNet training.
     """
@@ -145,7 +145,7 @@ def tb_display_cond_generation(writer, step, tag, starting_image, followup_image
     _, ax = plt.subplots(ncols=3, nrows=3, figsize=(7, 7))
     for _ax in ax.flatten(): _ax.set_axis_off()
 
-    ax[0, 0].set_title('starting image', color='cyan')
+    ax[0, 0].set_title(f'starting image, age: {starting_a*6}', color='cyan')
     ax[0, 0].imshow(starting_image[starting_image.shape[0] // 2, :, :], cmap='gray')
     ax[0, 1].imshow(starting_image[:, starting_image.shape[1] // 2, :], cmap='gray')
     ax[0, 2].imshow(starting_image[:, :, starting_image.shape[2] // 2], cmap='gray')

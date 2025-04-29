@@ -60,8 +60,8 @@ def images_to_tensorboard(
     """
     Visualize the generation on tensorboard
     """
-    # resample_fn = transforms.Spacing(pixdim=1.5)
-    resample_fn = transforms.Spacing(pixdim=1.3)
+    resample_fn = transforms.Spacing(pixdim=1.5)
+    # resample_fn = transforms.Spacing(pixdim=1.3)
     random_indices = np.random.choice( range(len(dataset)), 3 ) 
 
     for tag_i, i in enumerate(random_indices):
@@ -89,6 +89,7 @@ def images_to_tensorboard(
         utils.tb_display_cond_generation(
             writer=writer, 
             step=epoch, 
+            starting_a=starting_a,
             tag=f'{mode}/comparison_{tag_i}',
             starting_image=starting_image, 
             followup_image=followup_image, 
@@ -207,7 +208,7 @@ if __name__ == '__main__':
                     starting_z = batch['starting_latent'].to(DEVICE)  * scale_factor
                     followup_z = batch['followup_latent'].to(DEVICE)  * scale_factor
                     context    = batch['context'].to(DEVICE)
-                    print(f"[DEBUG] context shape at step {step} ({mode}): {context.shape}")
+                    # print(f"[DEBUG] context shape at step {step} ({mode}): {context.shape}")
                     starting_a = batch['starting_age'].to(DEVICE)
 
                     n = starting_z.shape[0] 
