@@ -696,12 +696,12 @@ def plot_recon_comparison(sample, df_metadata, df_latents, autoencoder, latent_s
 
     print(f"✅ Saved figure to {out_png_path}")
 
-def plot_delta_norms(start_latents, delta_vectors, save_path=None):
+def plot_delta_norms(delta_age, delta_vectors, save_path=None):
     """
     Plot histogram of delta vector norms.
     
     Args:
-        start_latents (np.ndarray): Start latent vectors (N, D)
+        delta_age (np.ndarray): age differences, scalar vector
         delta_vectors (np.ndarray): Delta vectors (N, D)
         save_path (str, optional): Where to save the figure. If None, just show.
     """
@@ -721,6 +721,31 @@ def plot_delta_norms(start_latents, delta_vectors, save_path=None):
         print(f"✅ Saved delta norms histogram to {save_path}")
     else:
         print('No saving path given')
+
+def plot_age_diff_histogram(age_diffs, save_path=None):
+    """
+    Plot a histogram of age differences between scan pairs.
+
+    Args:
+        age_diffs (list or np.ndarray): List of age differences (in months).
+        save_path (str, optional): Where to save the figure. If None, shows the plot.
+    """
+    age_diffs = np.asarray(age_diffs, dtype=np.float32)
+
+    plt.figure(figsize=(8, 6))
+    plt.hist(age_diffs, bins=np.arange(0, 4.5, 0.08), color="skyblue", edgecolor="black")
+    plt.title("Histogram of Age Differences Between Scans")
+    plt.xlabel("Age Difference (years)")
+    plt.ylabel("Number of Pairs")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("age_diff_histogram.png", dpi=150)
+
+    if save_path:
+        plt.savefig(save_path, dpi=150)
+        print(f"✅ Saved age difference histogram to {save_path}")
+    else:
+        plt.show()
 
 
 if __name__ == "__main__":
@@ -765,6 +790,7 @@ if __name__ == "__main__":
 
     start_latents = []
     delta_vectors = []
+    age_diffs = []
 
     for subject_id, scans in paired_train.items():
         if len(scans) < 2:
@@ -785,6 +811,7 @@ if __name__ == "__main__":
 
             start_latents.append(start_latent)
             delta_vectors.append(delta_vector)
+            age_diffs.append(age_diff)
 
     start_latents = np.vstack(start_latents)
     delta_vectors = np.vstack(delta_vectors)
@@ -794,7 +821,9 @@ if __name__ == "__main__":
 
     print(f"Training samples: {start_latents.shape[0]}, Latent dimension: {start_latents.shape[1]}")
 
-    plot_delta_norms(start_latents, delta_vectors, 'delta_norms_train.png')
+    plot_delta_norms(age_diffs, delta_vectors, 'delta_norms_train.png')
+    plot_age_diff_histogram(age_diffs, "age_diff_histogram.png")
+
 
     test_df = df_latents[df_latents["split"] == "test"] 
 
@@ -814,7 +843,7 @@ if __name__ == "__main__":
     # )
 
     sweep_rbf_hyperparameter(
-        param_values=[5, 10, 50, 100, 150, 200, 300, 400, 500, 614],
+        param_values=[500, 614],
         param_name="neighbors",
         start_latents=start_latents,
         delta_vectors=delta_vectors,
@@ -826,6 +855,19 @@ if __name__ == "__main__":
         transforms_fn=transforms_fn,
         save_prefix="plots/"
     )
+    # sweep_rbf_hyperparameter(
+    #     param_values=[5, 10, 50, 100, 150, 200, 300, 400, 500, 614],
+    #     param_name="neighbors",
+    #     start_latents=start_latents,
+    #     delta_vectors=delta_vectors,
+    #     test_df=test_df,
+    #     df_metadata=df_metadata,
+    #     df_latents=df_latents,
+    #     latent_shape=latent_shape,
+    #     aekl_checkpoint=aekl_checkpoint,
+    #     transforms_fn=transforms_fn,
+    #     save_prefix="plots/"
+    # )
 
     # sweep_rbf_hyperparameter(
     #     param_values=[0, 1e-4, 1e-3, 1e-2, 1e-1],
