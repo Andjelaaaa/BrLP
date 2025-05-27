@@ -14,7 +14,72 @@ from scipy.stats import f_oneway
 from pygam import LinearGAM, s
 import pickle
 import plotly.io as pio
+from scipy.stats import ttest_ind
+from statsmodels.stats.multitest import multipletests
 
+def compare_diagnosis_vs_control(csv_path, output_csv="group_diff_stats.csv", test="ttest"):
+    df = pd.read_csv(csv_path)
+
+    # Identify all z-score columns
+    zscore_cols = [col for col in df.columns if "__" in col and col.endswith("_zlocal")]
+    diagnoses = df["diagnosis"].unique()
+    diagnoses = [d for d in diagnoses if d != "CC"]  # exclude control
+
+    results = []
+
+    for col in zscore_cols:
+        region, metric = col.split("__")[0], col.split("__")[1].replace("_zlocal", "")
+
+        cc_values = df[df["diagnosis"] == "CC"][col].dropna()
+
+        for diag in diagnoses:
+            group_values = df[df["diagnosis"] == diag][col].dropna()
+
+            if len(cc_values) < 3 or len(group_values) < 3:
+                continue  # not enough data
+
+            # Use Welch’s t-test (unequal variance)
+            stat, p_value = ttest_ind(group_values, cc_values, equal_var=False)
+
+            results.append({
+                "region": region,
+                "metric": metric,
+                "comparison": f"{diag} vs CC",
+                "n_CC": len(cc_values),
+                "n_group": len(group_values),
+                "group_mean": np.mean(group_values),
+                "cc_mean": np.mean(cc_values),
+                "mean_diff": np.mean(group_values) - np.mean(cc_values),
+                "t_stat": stat,
+                "p_value": p_value
+            })
+
+    # Adjust p-values (FDR)
+    if results:
+        p_vals = [r["p_value"] for r in results]
+        reject, pvals_corr, _, _ = multipletests(p_vals, method='fdr_bh')
+        for i, r in enumerate(results):
+            r["p_fdr"] = pvals_corr[i]
+            r["significant"] = reject[i]
+
+        df_results = pd.DataFrame(results)
+        df_results.to_csv(output_csv, index=False)
+        print(f"✅ Saved results to {output_csv}")
+        return df_results
+    else:
+        print("⚠️ No valid comparisons made (possibly too few samples).")
+        return pd.DataFrame()
+
+
+# === BASE NAMES (ignoring left/right) ===
+def get_base_name(region):
+    if region.startswith("left_"):
+        return region.replace("left_", "")
+    elif region.startswith("right_"):
+        return region.replace("right_", "")
+    else:
+        return region
+        
 def compute_residual_std_comparison_per_metric(
     csv_all,
     output_dir,
@@ -119,7 +184,7 @@ def compute_residual_std_comparison_per_metric(
             height=600
         )
 
-        html_path = os.path.join(output_dir, f"resid_std_comparison_{metric}.html")
+        html_path = os.path.join(output_dir, f"resid_std_comparison_{metric}_{window_months}.html")
         pio.write_html(fig, file=html_path, auto_open=False)
 
     return f"✅ Created {len(metrics)} comparative Plotly HTML files in {output_dir}"
@@ -244,13 +309,14 @@ def compute_and_plot_gams_from_shape_features(
     df_all = pd.read_csv(csv_all)
     df_all = df_all[df_all["subject_id"] != "sub-3024"]  # optional
     df_all = df_all.dropna(subset=["age"])  # drop missing age
+    df_all["age_months"] = df_all["age"] * 6 * 12
     df_healthy = df_all[df_all["diagnosis"] == "CC"].copy()
 
     metric_cols = [col for col in df_healthy.columns if '__' in col and not col.startswith("background")]
     regions = sorted(set(col.split('__')[0] for col in metric_cols))
     metrics = sorted(set(col.split('__')[1] for col in metric_cols))
 
-    zscore_df = df_all[["subject_id", "image_uid", "age", "sex", "diagnosis"]].copy()
+    zscore_df = df_all[["subject_id", "image_uid", "age", "age_months", "sex", "diagnosis"]].copy()
     plot_data = []
 
     for metric in tqdm(metrics, desc="Processing metrics"):
@@ -259,10 +325,10 @@ def compute_and_plot_gams_from_shape_features(
             if col not in df_healthy.columns or col not in df_all.columns:
                 continue
 
-            X_healthy = (df_healthy["age"].values * 6).reshape(-1, 1)  # Age in months
+            X_healthy = (df_healthy["age_months"].values * 6).reshape(-1, 1)  
             y_healthy = df_healthy[col].values
 
-            X_all = (df_all["age"].values * 6).reshape(-1, 1)  # Age in months
+            X_all = (df_all["age_months"].values * 6).reshape(-1, 1) 
             y_all = df_all[col].values
 
             try:
@@ -275,7 +341,7 @@ def compute_and_plot_gams_from_shape_features(
                     print(f"⚠️ Skipping {col}: y_healthy contains NaN or Inf")
                     continue
 
-                print(f"🔍 Checking {col} - NaNs in age: {df_healthy['age'].isnull().sum()}, Infs in age: {np.isinf(df_healthy['age']).sum()}")
+                print(f"🔍 Checking {col} - NaNs in age: {df_healthy['age_months'].isnull().sum()}, Infs in age: {np.isinf(df_healthy['age_months']).sum()}")
                 print(f"NaNs in y: {np.isnan(y_healthy).sum()}, Infs in y: {np.isinf(y_healthy).sum()}")
 
                 # Fit GAM on healthy data
@@ -303,14 +369,14 @@ def compute_and_plot_gams_from_shape_features(
                     print(f"⚠️ Skipping {col}: invalid std_resid = {std_resid}")
 
                 # Store data for plotting
-                x_vals = np.linspace(df_all["age"].min(), df_all["age"].max(), 100)
+                x_vals = np.linspace(df_all["age_months"].min(), df_all["age_months"].max(), 100)
                 y_vals = gam.predict(x_vals)
                 for diagnosis in df_all["diagnosis"].unique():
                     df_diag = df_all[df_all["diagnosis"] == diagnosis]
                     plot_data.append(dict(
                         region=region,
                         metric=metric,
-                        x=df_diag["age"].values,
+                        x=df_diag["age_months"].values,
                         y=df_diag[col].values,
                         diagnosis=diagnosis,
                         fit_x=x_vals,
@@ -350,7 +416,7 @@ def compute_and_plot_gams_from_shape_features(
             name=f"{key} (colored by diagnosis)",
             marker=dict(color=color_all, size=5),
             visible=False,
-            showlegend=False
+            showlegend=True
         ))
 
         # Line fit (use first item, all fits are the same)
@@ -372,7 +438,7 @@ def compute_and_plot_gams_from_shape_features(
     fig.update_layout(
         sliders=[dict(active=0, pad={"t": 50}, steps=steps)],
         title="GAM Fits per Region/Metric",
-        xaxis_title="Age (months)",
+        xaxis_title="Age (years)",
         yaxis_title="Metric Value"
     )
     fig.write_html(plot_html)
@@ -471,7 +537,69 @@ def compute_long_df_and_analyze(healthy_csv, diagnoses_csv, metrics):
 
     return long_df, summary_df
 
+def plot_spider_charts_zlocal(csv_path, output_prefix="zscore_shape_spider_chart_zlocal"):
+    df = pd.read_csv(csv_path)
 
+    # Infer region names and metrics from columns
+    zlocal_cols = [col for col in df.columns if col.endswith("_zlocal")]
+    regions = sorted(set(col.split("__")[0] for col in zlocal_cols))
+    metrics = sorted(set(col.split("__")[1].replace("_zlocal", "") for col in zlocal_cols))
+
+    base_region_names = sorted(set(get_base_name(r) for r in regions))
+    px_colors = px.colors.qualitative.Plotly
+    base_region_colors = {base: px_colors[i % len(px_colors)] for i, base in enumerate(base_region_names)}
+    region_colors = {region: base_region_colors[get_base_name(region)] for region in regions}
+
+    # Compute global max across all z-local medians for scaling
+    all_median_values = []
+    for diag in ["CC", "mTBI", "OI"]:
+        diag_data = df[df["diagnosis"] == diag]
+        for region in regions:
+            region_metric_cols = [f"{region}__{metric}_zlocal" for metric in metrics]
+            if all(col in diag_data.columns for col in region_metric_cols):
+                median_abs_z = diag_data[region_metric_cols].abs().median()
+                all_median_values.append(median_abs_z.values)
+    global_rmax = np.max(np.vstack(all_median_values)) if all_median_values else 1
+
+    # Plot one spider chart per diagnosis
+    results = {}
+    for diag in ["CC", "mTBI", "OI"]:
+        diag_data = df[df["diagnosis"] == diag]
+        fig = go.Figure()
+
+        for region in regions:
+            region_metric_cols = [f"{region}__{metric}_zlocal" for metric in metrics]
+            if not all(col in diag_data.columns for col in region_metric_cols):
+                continue
+
+            median_abs_z = diag_data[region_metric_cols].abs().median()
+
+            fig.add_trace(go.Scatterpolar(
+                r=median_abs_z.values,
+                theta=metrics,
+                fill='toself',
+                name=region,
+                line=dict(color=region_colors[region])
+            ))
+
+        fig.update_layout(
+            polar=dict(
+                radialaxis=dict(
+                    visible=True,
+                    title="|Median Local Z-score|",
+                    range=[0, global_rmax]
+                )
+            ),
+            showlegend=True,
+            title=f"Local Z-Score Deviation per Region ({diag})"
+        )
+
+        out_html = f"{output_prefix}_{diag}.html"
+        fig.write_html(out_html)
+        results[diag] = out_html
+
+    return results
+        
 def plot_spider_charts_per_diagnosis(
     healthy_csv,
     diagnoses_csv,
@@ -496,15 +624,6 @@ def plot_spider_charts_per_diagnosis(
     region_names, zscores, _ = calculate_z_scores(df_healthy, df_diagnoses, metrics)
 
     print(f"Found {len(region_names)} regions.")
-
-    # === BASE NAMES (ignoring left/right) ===
-    def get_base_name(region):
-        if region.startswith("left_"):
-            return region.replace("left_", "")
-        elif region.startswith("right_"):
-            return region.replace("right_", "")
-        else:
-            return region
 
     base_region_names = sorted(set(get_base_name(r) for r in region_names))
 
@@ -620,6 +739,93 @@ def plot_parallel_coordinates(csv_path, subject_id, out_html_prefix="parallel_pl
 
     print(f"✅ Saved raw plot to: {raw_html}")
     print(f"✅ Saved z-score normalized plot to: {norm_html}")
+
+def plot_zscore_violin_zlocal(csv_zlocal_path, output_html="zlocal_violin_by_region.html"):
+    # === Load Data ===
+    df = pd.read_csv(csv_zlocal_path)
+
+    # === Metrics ===
+    metrics = [
+        "volume_mm3",
+        "centroid_x_mm",
+        "centroid_y_mm",
+        "centroid_z_mm",
+        "surface_area_mm2",
+        "compactness",
+        "elongation"
+    ]
+
+    # === Extract relevant columns
+    metric_cols = [col for col in df.columns if any(col.endswith(f"{m}_zlocal") for m in metrics)]
+    df_long = df.melt(
+        id_vars=["subject_id", "diagnosis"],
+        value_vars=metric_cols,
+        var_name="region_metric",
+        value_name="zscore"
+    )
+    df_long["region"] = df_long["region_metric"].apply(lambda x: x.split("__")[0])
+    df_long["metric"] = df_long["region_metric"].apply(lambda x: x.split("__")[1].replace("_zlocal", ""))
+
+    # === Define consistent diagnosis colors ===
+    diagnosis_colors = {
+        "CC": px.colors.qualitative.Set1[0],
+        "mTBI": px.colors.qualitative.Set1[1],
+        "OI": px.colors.qualitative.Set1[2]
+    }
+
+    # === Initialize figure for first metric ===
+    first_metric = metrics[0]
+    fig = go.Figure()
+
+    for diag in df_long["diagnosis"].unique():
+        subset = df_long[(df_long["metric"] == first_metric) & (df_long["diagnosis"] == diag)]
+        fig.add_trace(go.Violin(
+            x=subset["region"],
+            y=subset["zscore"],
+            name=diag,
+            line_color=diagnosis_colors.get(diag, "gray"),
+            hovertext=[
+                f"Subject: {sid}<br>Diagnosis: {diag}<br>Z: {val:.2f}"
+                for sid, val in zip(subset["subject_id"], subset["zscore"])
+            ],
+            hoverinfo="text",
+            box_visible=True,
+            meanline_visible=True
+        ))
+
+    # === Dropdown buttons for metric switching ===
+    buttons = []
+    for metric in metrics:
+        y_data = [
+            df_long[(df_long["metric"] == metric) & (df_long["diagnosis"] == diag)]["zscore"]
+            for diag in df_long["diagnosis"].unique()
+        ]
+        buttons.append(dict(
+            label=metric,
+            method="update",
+            args=[
+                {"y": y_data},
+                {"title": f"Z-scores per Region for {metric}"}
+            ]
+        ))
+
+    fig.update_layout(
+        updatemenus=[dict(
+            type="dropdown",
+            direction="down",
+            buttons=buttons,
+            x=0.85,
+            y=1.15
+        )],
+        title=f"Z-scores per Region for {first_metric}",
+        yaxis_title="Z-score (local)",
+        template="plotly_white",
+        violingap=0.2,
+        violinmode="group"
+    )
+
+    fig.write_html(output_html)
+    print(f"✅ Violin plot saved to {output_html}")
 
 def plot_zscore_violin_with_metric_selector(
     df_healthy_path, df_diagnoses_path, output_html="zscore_violin_by_region.html"
@@ -827,7 +1033,7 @@ def extract_region_features(segmentation, voxel_spacing=(1.0, 1.0, 1.0)):
 
         # === Surface Area (simple method)
         # surface_mask = measure.mesh_surface_area(mask.astype(float)) * np.mean(voxel_spacing)**2  # rough approx
-        # If you want a simpler surface area: count border voxels
+        # Simpler surface area: count border voxels
         surface_area = np.sum(scipy.ndimage.binary_erosion(mask) != mask) * voxel_area
 
         # === Compactness
@@ -951,9 +1157,9 @@ if __name__ == "__main__":
     # voxel_spacing=(1.0, 1.0, 1.0)
     # )
 
-    merge_csvs("/home/andim/projects/def-bedelb/andim/brlp-data/healthy_shape_features_KOALA.csv", 
-               "/home/andim/projects/def-bedelb/andim/brlp-data/healthy_shape_features.csv", 
-               "/home/andim/projects/def-bedelb/andim/brlp-data/shape_features_all.csv")
+    # merge_csvs("/home/andim/projects/def-bedelb/andim/brlp-data/healthy_shape_features_KOALA.csv", 
+    #            "/home/andim/projects/def-bedelb/andim/brlp-data/healthy_shape_features.csv", 
+    #            "/home/andim/projects/def-bedelb/andim/brlp-data/shape_features_all.csv")
 
     # plot_spider_charts_per_diagnosis(
     # healthy_csv="/home/andim/projects/def-bedelb/andim/brlp-data/healthy_shape_features.csv",
@@ -979,22 +1185,31 @@ if __name__ == "__main__":
     # csv_all="/home/andim/projects/def-bedelb/andim/brlp-data/shape_features_all.csv",
     # output_csv="/home/andim/projects/def-bedelb/andim/brlp-data/zscored_all.csv",
     # model_dir="gam_models",
-    # plot_html="gam_fits.html"
+    # plot_html="gam_fits_age_months.html"
     # )
+
+    ## Statistical testing
+    compare_diagnosis_vs_control("/home/andim/projects/def-bedelb/andim/brlp-data/zscored_all_local_1mth.csv", output_csv="group_diff_stats_1mth.csv")
+    compare_diagnosis_vs_control("/home/andim/projects/def-bedelb/andim/brlp-data/zscored_all_local.csv", output_csv="group_diff_stats_3mth.csv")
 
     compute_local_zscores_with_gam(
     csv_all="/home/andim/projects/def-bedelb/andim/brlp-data/shape_features_all.csv",
-    output_csv="/home/andim/projects/def-bedelb/andim/brlp-data/zscored_all_local.csv",
-    model_dir="gam_models_local",
-    window_months=3  # Use ±3 months around each age
+    output_csv="/home/andim/projects/def-bedelb/andim/brlp-data/zscored_all_local_1-5mth.csv",
+    model_dir="gam_models_local_1mth",
+    window_months=1.5  # Use ±3 months around each age
     )
 
     compute_residual_std_comparison_per_metric(
     csv_all="/home/andim/projects/def-bedelb/andim/brlp-data/shape_features_all.csv",
     output_dir="resid_std_comparison_plots",
-    window_months=3,
-    step=1
-)
+    window_months=1.5,
+    step=1)
+
+    plot_zscore_violin_zlocal('/home/andim/projects/def-bedelb/andim/brlp-data/zscored_all_local_1-5mth.csv', output_html="zlocal_violin_by_region_1mth.html")
+
+    # plot_spider_charts_zlocal("/home/andim/projects/def-bedelb/andim/brlp-data/zscored_all_local.csv")
+
+    
 
 
 
