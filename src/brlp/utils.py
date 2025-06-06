@@ -10,6 +10,9 @@ from monai.data.meta_tensor import MetaTensor
 from torch.utils.tensorboard.writer import SummaryWriter
 
 
+from typing import Union
+from torch.utils.tensorboard import SummaryWriter
+
 class AverageLoss:
     """
     Utility class to track losses
@@ -19,7 +22,7 @@ class AverageLoss:
     def __init__(self):
         self.losses_accumulator = {}
     
-    def put(self, loss_key:str, loss_value:Union[int,float]) -> None:
+    def put(self, loss_key: str, loss_value: Union[int, float]) -> None:
         """
         Store value
 
@@ -31,32 +34,54 @@ class AverageLoss:
             self.losses_accumulator[loss_key] = []
         self.losses_accumulator[loss_key].append(loss_value)
     
-    def pop_avg(self, loss_key:str) -> float:
+    def pop_avg(self, loss_key: str) -> float:
         """
-        Average the stored values of a given metric
+        Average the stored values of a given metric, then clear them.
+        If the list is empty or the key does not exist, returns 0.0.
 
         Args:
             loss_key (str): Metric name
 
         Returns:
-            float: average of the stored values
+            float: average of the stored values (0.0 if none)
         """
         if loss_key not in self.losses_accumulator:
-            return None
+            return 0.0
         losses = self.losses_accumulator[loss_key]
+        if not losses:
+            return 0.0
+        avg = sum(losses) / len(losses)
         self.losses_accumulator[loss_key] = []
+        return avg
+
+    def get_avg(self, loss_key: str) -> float:
+        """
+        Return the average of the stored values of a given metric
+        WITHOUT clearing them. If there are no values, returns 0.0.
+
+        Args:
+            loss_key (str): Metric name
+
+        Returns:
+            float: average of the stored values (0.0 if none)
+        """
+        if loss_key not in self.losses_accumulator:
+            return 0.0
+        losses = self.losses_accumulator[loss_key]
+        if not losses:
+            return 0.0
         return sum(losses) / len(losses)
     
     def to_tensorboard(self, writer: SummaryWriter, step: int):
         """
         Logs the average value of all the metrics stored 
-        into Tensorboard.
+        into Tensorboard, then clears them.
 
         Args:
             writer (SummaryWriter): Tensorboard writer
             step (int): Tensorboard logging global step 
         """
-        for metric_key in self.losses_accumulator.keys():
+        for metric_key in list(self.losses_accumulator.keys()):
             writer.add_scalar(metric_key, self.pop_avg(metric_key), step)
             
             

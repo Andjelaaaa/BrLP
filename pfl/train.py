@@ -5,17 +5,32 @@ import wandb
 import numpy as np
 import pandas as pd
 from datetime import datetime
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, Dataset
 from sklearn.model_selection import train_test_split
 from brlp import init_autoencoder, const
+from monai.utils import set_determinism
 from monai import transforms
 from model import DeltaPredictor, combined_loss
 from utils import log_recon_comparison_to_wandb, load_data
 
+class IndexedTensorDataset(Dataset):
+    def __init__(self, X, y, indices):
+        self.X = torch.from_numpy(X).float()
+        self.y = torch.from_numpy(y).float()
+        self.indices = indices  # This should be an array of integers corresponding to global indices
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx], self.indices[idx]
+
+set_determinism(0)
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
 if __name__ == '__main__':
     # === Set up ===
     run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
-    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     data_path = "/home/andim/projects/def-bedelb/andim/brlp-data"
     aekl_ckpt = "/home/andim/scratch/brlp/ae_output/autoencoder-ep-318.pth"
@@ -35,16 +50,22 @@ if __name__ == '__main__':
     # === Load data ===
     latent_csv = os.path.join(data_path, "latent_trajectories.csv")
     meta_csv = os.path.join(data_path, "A.csv")
-    
-    start_latents, delta_vectors, age_diffs, subject_ids, image_uids, df_latents, df_metadata, latent_cols, splits = load_data(latent_csv, meta_csv)
+
+    start_latents, delta_vectors, age_diffs, start_ages, followup_ages, subject_ids, image_uids, df_latents, df_metadata, latent_cols, splits = load_data(latent_csv, meta_csv)
     follow_latents = start_latents + delta_vectors * age_diffs[:, None]
 
     X = np.hstack([start_latents, age_diffs[:, None]])
     y = follow_latents
 
-    # Apply pre-defined split
-    X_train, y_train = X[splits == "train"], y[splits == "train"]
-    train_loader = DataLoader(TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train)), batch_size=8, shuffle=True)
+    assert len(splits) == X.shape[0] == y.shape[0], f"Inconsistent data shapes! X: {X.shape}, y: {y.shape}, splits: {splits.shape}"
+
+    train_mask = splits == "train"
+    train_indices = np.where(train_mask)[0]  # array of global indices
+
+    X_train, y_train = X[train_mask], y[train_mask]
+
+    train_dataset = IndexedTensorDataset(X_train, y_train, train_indices)
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
 
     # === Print shapes ===
     print(f"🔹 start_latents shape: {start_latents.shape}")     # (N, latent_dim)
@@ -78,7 +99,7 @@ if __name__ == '__main__':
         model.train()
         total_loss, total_cos, total_norm, total_recon = 0, 0, 0, 0
 
-        for xb, yb in train_loader:
+        for xb, yb, global_idx in train_loader:
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)
             pred_latent = model(xb)
             start_latent = xb[:, :-1]
@@ -99,7 +120,6 @@ if __name__ == '__main__':
                     recon_true.append(r_true)
                     recon_pred.append(r_pred)
 
-                    # Immediately free unused tensors
                     del z_true, z_pred, r_true, r_pred
                     torch.cuda.empty_cache()
 
@@ -116,7 +136,6 @@ if __name__ == '__main__':
             total_norm += norm_loss
             total_recon += recon_loss
 
-        # === Log all losses
         wandb.log({
             "epoch": epoch,
             "train_total_loss": total_loss / len(train_loader),
@@ -125,17 +144,19 @@ if __name__ == '__main__':
             "train_recon_loss": total_recon / len(train_loader),
         })
 
-        # === Visualize a sample every 10 epochs
         if epoch % 10 == 0:
             xb_cpu = xb.cpu().numpy()
             yb_cpu = yb.cpu().numpy()
             pred_latent_cpu = pred_latent.detach().cpu().numpy()
 
+            global_id = global_idx[0].item()
+            print(f'Logging global_id: {global_id}...')
+            
             sample_dict = {
-                "subject_id": subject_ids[0],
-                "image_uid": image_uids[0],
-                "start_age": xb_cpu[0, -1],
-                "followup_age": xb_cpu[0, -1] + age_diffs[0],
+                "subject_id": subject_ids[global_id], 
+                "image_uid": image_uids[global_id], 
+                "start_age": start_ages[global_id],
+                "followup_age": followup_ages[global_id],
                 "l2_error": float(np.linalg.norm(pred_latent_cpu[0] - yb_cpu[0])),
                 "mse": float(np.mean((pred_latent_cpu[0] - yb_cpu[0]) ** 2)),
                 "error_diff": float(np.linalg.norm(pred_latent_cpu[0] - yb_cpu[0]) - np.linalg.norm(yb_cpu[0] - xb_cpu[0, :-1])),
@@ -159,12 +180,10 @@ if __name__ == '__main__':
                 step=epoch,
                 tag="Training Recons"
             )
-        # Only delete recons after visualizing
-        # Safe to delete now
+
         del xb, yb, pred_latent, delta_pred, delta_true, recon_true, recon_pred
         torch.cuda.empty_cache()
 
-    # === Save model ===
     os.makedirs(run_name, exist_ok=True)
     torch.save(model.state_dict(), f"{run_name}/trained_model.pt")
     print(f"✅ Model saved to '{run_name}/trained_model.pt'")

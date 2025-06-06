@@ -92,19 +92,27 @@ RESOLUTION = 1.3
 
 # shape of the MNI152 (1mm^3) template
 # INPUT_SHAPE_1mm = (182, 218, 182)   
-INPUT_SHAPE_1mm = (135, 177, 138)   
+# for ANTS 0-8
+# INPUT_SHAPE_1mm = (135, 177, 138)   
+# for MNI 4.5-8.5
+INPUT_SHAPE_1mm = (197, 233, 189)   
 
 # resampling the MNI152 to (1.5mm^3)
 # INPUT_SHAPE_1p5mm = (122, 146, 122) 
-# resampling the template to (1.3mm^3)
-INPUT_SHAPE_1p5mm = (104, 136, 106)   
+# resampling the template to (1.3mm^3) for ANTS 0-8
+# INPUT_SHAPE_1p5mm = (104, 136, 106)   
+# resampling the template to (1.3mm^3) for MNI 4.5-8.5
+INPUT_SHAPE_1p5mm = (152, 179, 146)   
 
 # Adjusting the dimensions to be divisible by 8 (2^3 where 3 are the downsampling layers of the AE)
 # INPUT_SHAPE_AE = (120, 144, 120)  
-INPUT_SHAPE_AE = (112, 144, 112)  
+# INPUT_SHAPE_AE = (112, 144, 112)
+INPUT_SHAPE_AE = (120, 144, 120)    
 
 # Latent shape of the autoencoder 
-LATENT_SHAPE_AE = (3, 15, 18, 15)   
+# LATENT_SHAPE_AE = (3, 15, 18, 15)  
+# LATENT_SHAPE_AE = (3, 14, 18, 14) 
+LATENT_SHAPE_AE = (3, 15, 18, 15) 
 
 # Adjusting the latent space (with constant padding) to be divisible by 4 (2^2 where 2 are the downsampling layers of U-Net)
 LATENT_SHAPE_DM = (3, 16, 20, 16)   
@@ -118,10 +126,17 @@ LATENT_SHAPE_DM = (3, 16, 20, 16)
 # ])
 
 # Affine matrix for ANTS 0-8 resampled to 1.3mm^3
+# MNI152_1P5MM_AFFINE = np.array([         
+#     [ -1.3, 0,    0,    65   ],
+#     [ 0,    1.3,  0,    -105 ],
+#     [ 0,    0,    1.3,  -56  ],
+#     [ 0,    0,     0,   1    ]
+# ])
+# Affine matrix for ANTS 0-8 resampled to 1.3mm^3
 MNI152_1P5MM_AFFINE = np.array([         
-    [ -1.3, 0,    0,    65   ],
-    [ 0,    1.3,  0,    -105 ],
-    [ 0,    0,    1.3,  -56  ],
+    [ -1.3, 0,    0,    -98   ],
+    [ 0,    1.3,  0,    -134 ],
+    [ 0,    0,    1.3,  -72  ],
     [ 0,    0,     0,   1    ]
 ])
 
