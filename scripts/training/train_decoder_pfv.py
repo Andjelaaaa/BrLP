@@ -13,6 +13,7 @@ import copy
 from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
 import wandb
+from PIL import Image
 
 from generative.losses import PerceptualLoss, PatchAdversarialLoss
 from monai.utils import set_determinism
@@ -30,6 +31,90 @@ from brlp import (
     KLDivergenceLoss, GradientAccumulation,
     init_autoencoder, init_patch_discriminator
 )
+def log_recon_3x4_to_wandb(
+    meta: dict,
+    t1_vol_np: np.ndarray,
+    t1_recon_np: np.ndarray,
+    t2_true_np: np.ndarray,
+    t2_pred_np: np.ndarray,
+    step: int = None,
+    tag: str = "Recon 3x4"
+):
+    """
+    Logs a single 3×4 grid for:
+      [T1 input, T1 VAE‐recon, T2 true, T2 predicted]
+    across [axial, coronal, sagittal] views.
+
+    Args:
+        meta (dict): must contain at least:
+            'subject_id', 'start_age', 'followup_age', optional 'image_uid', error metrics...
+        t1_vol_np      ([1,D,H,W]): baseline input
+        t1_recon_np    ([1,D,H,W]): VAE‐reconstruction of baseline
+        t2_true_np     ([1,D,H,W]): true follow-up
+        t2_pred_np     ([1,D,H,W]): predicted follow-up
+        step (int): W&B step
+        tag (str): W&B key
+    """
+    # Drop channel dim, get [D,H,W]
+    t1  = t1_vol_np[0]
+    r1  = t1_recon_np[0]
+    t2  = t2_true_np[0]
+    p2  = t2_pred_np[0]
+    D,H,W = t1.shape
+
+    # mid‐slice indices
+    iz = D//2
+    iy = H//2
+    ix = W//2
+
+    # prepare 12 images in row‐major order:
+    images = [
+        # Axial row (slice along axis=0)
+        t1 [iz,:,:], r1 [iz,:,:], t2 [iz,:,:], p2 [iz,:,:],
+        # Coronal row (axis=1)
+        t1 [:,iy,:], r1 [:,iy,:], t2 [:,iy,:], p2 [:,iy,:],
+        # Sagittal row (axis=2)
+        t1 [:,:,ix], r1 [:,:,ix], t2 [:,:,ix], p2 [:,:,ix],
+    ]
+
+    # titles for each subplot
+    sa = meta.get('start_age', None)
+    fa = meta.get('followup_age', None)
+    sid = meta.get('subject_id','')
+    uid = meta.get('image_uid','')
+    top_title = f"{sid}  |  ΔAge={(fa-sa):.2f} yr" if sa is not None and fa is not None else sid
+    if uid: top_title += f"  |  UID={uid}"
+    cols = ["T₁ Input", "T₁ Recon", "T₂ True", "T₂ Pred"]
+    rows = ["Axial", "Coronal", "Sagittal"]
+    titles = []
+    for view in rows:
+        for col in cols:
+            if view=="Axial" and col=="T₁ Input" and sa is not None:
+                titles.append(f"{col}\n(age={sa:.2f})")
+            elif view=="Axial" and col=="T₂ True" and fa is not None:
+                titles.append(f"{col}\n(age={fa:.2f})")
+            else:
+                titles.append(col)
+
+    # plot 3×4
+    fig, axes = plt.subplots(3, 4, figsize=(16, 12))
+    axes = axes.flatten()
+    for ax, img, ttl in zip(axes, images, titles):
+        ax.imshow(np.rot90(img), cmap="gray", vmin=0, vmax=1)
+        ax.set_title(ttl, fontsize=10)
+        ax.axis("off")
+    fig.suptitle(top_title, fontsize=14)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    # save, log, remove
+    tmp = f"tmp_{sid}_{uid}_3x4.png"
+    plt.savefig(tmp, dpi=120)
+    plt.close(fig)
+    if step is not None:
+        wandb.log({tag: wandb.Image(tmp)}, step=step)
+    else:
+        wandb.log({tag: wandb.Image(tmp)})
+    os.remove(tmp)
 
 def log_recon_comparison_to_wandb(
     meta: dict,
@@ -239,6 +324,21 @@ class AgeConditionalDecoder(nn.Module):
         # 7) Run through original decoder cascade
         x_pred = self.decoder_body(z_proj)  # [B, 1, D_img, H_img, W_img]
         return x_pred
+    
+# ─── Define FullPredictor (encoder frozen + cond_decoder) ───────
+class FullPredictor(nn.Module):
+    def __init__(self, encoder, cond_decoder):
+        super().__init__()
+        self.encoder = encoder       # frozen
+        self.cond_decoder = cond_decoder
+
+    def forward(self, x0, age_target):
+        # x0: [B,1,D,H,W], age_target: [B,1]
+        with torch.no_grad():
+            z_mu, z_sigma = self.encoder.encode(x0)
+            z = self.encoder.sampling(z_mu, z_sigma)  # [B, latent_channels, D_lat, H_lat, W_lat]
+        x1_pred = self.cond_decoder(z, age_target)    # [B,1,D,H,W]
+        return x1_pred
 
 class LongitudinalMRIDataset(Dataset):
     """
@@ -323,6 +423,9 @@ if __name__ == '__main__':
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+
+    # To cumulate difference plots and then create a gif
+    diff_frames = []
 
     # Initialize WandB
     wandb.init(
@@ -409,21 +512,12 @@ if __name__ == '__main__':
     # Now z_dummy.shape == (1, latent_channels, D_lat, H_lat, W_lat)
     cond_decoder.initialize_projection(z_dummy.shape, DEVICE)
     # ─────────────────────────────────────────────────────────────────
-
-    # ─── Define FullPredictor (encoder frozen + cond_decoder) ───────
-    class FullPredictor(nn.Module):
-        def __init__(self, encoder, cond_decoder):
-            super().__init__()
-            self.encoder = encoder       # frozen
-            self.cond_decoder = cond_decoder
-
-        def forward(self, x0, age_target):
-            # x0: [B,1,D,H,W], age_target: [B,1]
-            with torch.no_grad():
-                z_mu, z_sigma = self.encoder.encode(x0)
-                z = self.encoder.sampling(z_mu, z_sigma)  # [B, latent_channels, D_lat, H_lat, W_lat]
-            x1_pred = self.cond_decoder(z, age_target)    # [B,1,D,H,W]
-            return x1_pred
+    # Unfreeze last k blocks (e.g. k=2)
+    k = 2
+    layers = list(cond_decoder.decoder_body.children())
+    for layer in layers[-k:]:
+        for p in layer.parameters():
+            p.requires_grad = True
 
     model = FullPredictor(autoencoder, cond_decoder).to(DEVICE)
 
@@ -559,30 +653,105 @@ if __name__ == '__main__':
 
                 # 5) Build meta dict including subject_id and image_uid
                 meta = {
-                    'subject_id':    subject_id,     # e.g. “sub-10098” 
+                    'subject_id':    subject_id[0],     # e.g. “sub-10098” 
                     'start_age':     age0_years,     # in years
                     'followup_age':  age1_years      # in years
                 }
 
-                # 6) Log 3×3 grid of [baseline, true follow-up, pred follow-up]
-                log_recon_comparison_to_wandb(
+                log_recon_3x4_to_wandb(
                     meta,
-                    baseline_vol,   # [1,D,H,W]
-                    true_vol,       # [1,D,H,W]
-                    pred_vol,       # [1,D,H,W]
-                    step=it,
-                    tag="Train/Reconstruction_Comparison"
-                )
-
-                # 7) (Optional) Log “VAE recon vs pred” in a separate grid:
-                log_recon_comparison_to_wandb(
-                    meta,
-                    recon_vol,      # [1,D,H,W] ← VAE’s baseline reconstruction
+                    baseline_vol,
+                    recon_vol,
                     true_vol,
                     pred_vol,
                     step=it,
-                    tag="Train/VAE_vs_Pred"
+                    tag="Train/Recon_Pred"
                 )
+
+                # 1) Compute recon_t0, recon_t1
+                with torch.no_grad():
+                    recon0 = autoencoder.reconstruct(img0[:1])
+                    recon1 = autoencoder.reconstruct(img1[:1])
+                recon_t0 = recon0[0,0].cpu().numpy()[None]
+                recon_t1 = recon1[0,0].cpu().numpy()[None]
+
+                # 2) Compute diffs and log them
+                # D1 = true_vol[0] - baseline_vol[0] # T2true - T1
+                # D2 = true_vol[0] - recon_t0[0] #T2true - T1recon
+                D1 = np.abs(pred_vol[0] - true_vol[0]) #T2pred-T2true
+                D2 = np.abs(pred_vol[0] - baseline_vol[0]) #T2pred-T1
+                D3 = np.abs(pred_vol[0] - recon_t0[0]) #T2pred-T1recon
+                D4 = np.abs(true_vol[0] - baseline_vol[0]) #T2true-T1
+                D5 = np.abs(recon_t1[0] - recon_t0[0]) #T2recon-T1recon
+                m = max(D.max() for D in (D1,D2,D3,D4,D5))
+                iz = D1.shape[0]//2
+                # make a 1×5 figure
+                fig, axes = plt.subplots(1, 5, figsize=(15,4), constrained_layout=True)
+                titles = ["|T2pred–T2true|","|T2pred–T1|","|T2pred–T1recon|","|T2true–T1|","|T2recon–T1recon|"]
+                for ax, D, ttl in zip(axes, (D1,D2,D3,D4,D5), titles):
+                    im = ax.imshow(np.rot90(D[iz]), cmap="hot", vmin=0, vmax=m)
+                    ax.set_title(ttl, fontsize=9)
+                    ax.axis("off")
+
+                # add single colorbar on the right
+                cbar = fig.colorbar(im, ax=axes, orientation="vertical", fraction=0.02, pad=0.01)
+                cbar.set_label("Abs. Error", rotation=90)
+
+                delta_age = age1_years - age0_years
+                fig.suptitle(f"Epoch {epoch} | {subject_id[0]}  |  ΔAge={delta_age:.2f} yr", fontsize=12)
+                # plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+                # save + log
+                tmpd = f"abs_errors_e{epoch}_it{it}.png"
+                fig.savefig(tmpd, dpi=100)
+                plt.close(fig)
+
+                # log to W&B
+                wandb.log({ "Errors/5-way": wandb.Image(tmpd) }, step=it)
+
+                # keep the filename for the GIF
+                diff_frames.append(tmpd)
+                
+                # tmpd = f"tmp_err_{subject_id[0]}_{it}.png"
+                # fig.savefig(tmpd, dpi=100); plt.close(fig)
+                # wandb.log({"Errors/5-map": wandb.Image(tmpd)}, step=it)
+                # os.remove(tmpd)
+
+                # 3) If you want mean‐absolute‐errors of any pair:
+                mae_pred_true   = float(D1.mean())   # for T2pred–T2true
+                mae_pred_t1     = float(D2.mean())
+                mae_pred_t1rec  = float(D3.mean())
+                mae_true_t1     = float(D4.mean())
+                mae_recon_t1rec = float(D5.mean())
+
+                wandb.log({
+                    "mae/T2pred-T2true":      mae_pred_true,
+                    "mae/T2pred-T1":        mae_pred_t1,
+                    "mae/T2pred-T1recon":   mae_pred_t1rec,
+                    "mae/T2true-T1":        mae_true_t1,
+                    "mae/T2recon-T1recon":         mae_recon_t1rec,
+                    "delta_age":          delta_age
+                }, step=it)
+
+                # 6) Log 3×3 grid of [baseline, true follow-up, pred follow-up]
+                # log_recon_comparison_to_wandb(
+                #     meta,
+                #     baseline_vol,   # [1,D,H,W]
+                #     true_vol,       # [1,D,H,W]
+                #     pred_vol,       # [1,D,H,W]
+                #     step=it,
+                #     tag="Train/Reconstruction_Comparison"
+                # )
+
+                # # 7) (Optional) Log “VAE recon vs pred” in a separate grid:
+                # log_recon_comparison_to_wandb(
+                #     meta,
+                #     recon_vol,      # [1,D,H,W] ← VAE’s baseline reconstruction
+                #     true_vol,
+                #     pred_vol,
+                #     step=it,
+                #     tag="Train/VAE_vs_Pred"
+                # )
 
             total_counter += 1
 
@@ -620,5 +789,24 @@ if __name__ == '__main__':
         else:
             print(f"Epoch {epoch} ▶︎ Train L1 = {avgloss.get_avg('Generator/rec_loss'):.4f}")
 
+    # read back all frames in order
+    frames = [Image.open(f) for f in diff_frames]
+    gif_path = "diff_evolution.gif"
+    frames[0].save(
+        gif_path,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=750,   # ms per frame
+        loop=0          # 0 = infinite loop
+    )  
+
+    # upload the GIF as a W&B video
+    wandb.log({ "Diffs Evolution": wandb.Video(gif_path, format="gif") })
+
+    # clean up
+    for fn in diff_frames:
+        os.remove(fn)
+    os.remove(gif_path)
     # ── Finish W&B run ───────────────────────────────────────
     wandb.finish()

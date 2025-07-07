@@ -88,6 +88,72 @@ def make_csv_B(df):
                 data.append(record)
     return pd.DataFrame(data)
 
+def make_csv_trios(df):
+    """
+    Creates CSV of scan trios: for each subject, all combinations (x_a, x_b, x_c)
+    such that x_a < x_b < x_c in acquisition order.
+    """
+    coarse_regions  = const.COARSE_REGIONS
+    code_map        = const.SYNTHSEG_CODEMAP
+
+    records = []
+    for record in tqdm(df.to_dict(orient='records')):
+        segm = nib.load(record['segm_path']).get_fdata().round()
+        record['head_size'] = (segm > 0).sum()
+        
+        for region in coarse_regions: 
+            record[region] = 0
+        
+        for code, region in code_map.items():
+            if region == 'background': continue
+            coarse_region = region.replace('left_', '').replace('right_', '')
+            record[coarse_region] += (segm == code).sum()
+        
+        records.append(record)
+    
+    df = pd.DataFrame(records)
+
+    # decide which field to sort on
+    sorting_field = 'months_to_screening' if 'months_to_screening' in df.columns else 'age'
+
+    triplets = []
+    for subject_id in tqdm(df.subject_id.unique(), desc="Subjects"):
+        subj = df[df.subject_id == subject_id].sort_values(sorting_field, ascending=True)
+        n = len(subj)
+        # for each ordered triple i < j < k
+        for i in range(n):
+            for j in range(i + 1, n):
+                for k in range(j + 1, n):
+                    rec_a = subj.iloc[i]
+                    rec_b = subj.iloc[j]
+                    rec_c = subj.iloc[k]
+
+                    # start with common keys
+                    base = {
+                        'subject_id': rec_a.subject_id,
+                        'sex':         rec_a.sex,
+                        'split':       rec_a.split
+                    }
+
+                    # determine which columns remain to expand
+                    other_cols = [c for c in df.columns if c not in base]
+
+                    # build the triple record
+                    record = base.copy()
+                    for col in other_cols:
+                        if col == 'age':
+                            record[f'starting_{col}']   = ((rec_a[col] * 6) - 1.0) / (6.9 - 1.0)
+                            record[f'followup1_{col}']  = ((rec_b[col] * 6) - 1.0) / (6.9 - 1.0)
+                            record[f'followup2_{col}']  = ((rec_c[col] * 6) - 1.0) / (6.9 - 1.0)
+                        else:
+                            record[f'starting_{col}']   = rec_a[col]
+                            record[f'followup1_{col}']  = rec_b[col]
+                            record[f'followup2_{col}']  = rec_c[col]
+
+
+                    triplets.append(record)
+
+    return pd.DataFrame(triplets)
 
 if __name__ == '__main__':
 
@@ -101,15 +167,20 @@ if __name__ == '__main__':
     # read the dataset
     df = pd.read_csv(args.dataset_csv)
 
-    print()
-    print('> Creating CSV A\n')
-    csv_A = make_csv_A(df)
-    if "KOALA" in args.dataset_csv:
-        csv_A.to_csv(os.path.join(args.output_path, 'A_koala.csv'), index=False)
-    else:
-        csv_A.to_csv(os.path.join(args.output_path, 'A.csv'), index=False)
+    # print()
+    # print('> Creating CSV A\n')
+    # csv_A = make_csv_A(df)
+    # if "KOALA" in args.dataset_csv:
+    #     csv_A.to_csv(os.path.join(args.output_path, 'A_koala.csv'), index=False)
+    # else:
+    #     csv_A.to_csv(os.path.join(args.output_path, 'A.csv'), index=False)
 
     # print()
     # print('> Creating CSV B\n')
     # csv_B = make_csv_B(csv_A)
     # csv_B.to_csv(os.path.join(args.output_path, 'B.csv'), index=False)
+
+    print()
+    print('> Creating CSV C\n')
+    csv_C = make_csv_trios(df) # reading csv A
+    csv_C.to_csv(os.path.join(args.output_path, 'C_nonnormed_vol.csv'), index=False)

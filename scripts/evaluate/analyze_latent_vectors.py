@@ -4,6 +4,8 @@ import numpy as np
 from tqdm import tqdm
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
@@ -12,6 +14,7 @@ import matplotlib.cm as cm
 from sklearn.metrics import classification_report, accuracy_score
 from sklearn.model_selection import StratifiedKFold
 from collections import Counter
+import plotly.graph_objects as go
 
 def train_and_plot_LDA_CV(csv_path, output_fig_name, n_splits=5):
     # === Load and filter data
@@ -493,6 +496,117 @@ def create_latent_csv(csv_paths, output_csv_path):
     latent_df.to_csv(output_csv_path, index=False)
     print(f"✅ Merged latent vectors saved to: {output_csv_path}")
 
+def analyze_within_between_latent_distances(csv_path):
+    # ─── 1. LOAD DATA ────────────────────────────────────────────────────────
+    # Replace with your actual path
+    df = pd.read_csv(csv_path)
+
+    # Remove KOALA participants
+    pattern = r"^sub-\d{5,}$"
+    # this will keep only rows where subject_id matches sub- followed by ≥5 digits
+    df = df[df['subject_id'].str.match(pattern)]
+
+    # Identify latent columns
+    latent_cols = [c for c in df.columns if c.startswith("latent_")]
+    X = df[latent_cols].values
+    subjects = df["subject_id"].values
+    ages = df["age"].values.astype(float)
+
+    # ─── 2. NORMALIZE ────────────────────────────────────────────────────────
+    scaler = StandardScaler()
+    X_norm = scaler.fit_transform(X)
+
+    # ─── 3. K-MEANS & EXTREME VECTORS ───────────────────────────────────────
+    k = 3  # choose # clusters you like
+    kmeans = KMeans(n_clusters=k, random_state=42)
+    labels = kmeans.fit_predict(X_norm)
+    centers = kmeans.cluster_centers_
+
+    # distance of each sample to its cluster centroid
+    dists = np.linalg.norm(X_norm - centers[labels], axis=1)
+
+    # define extremes as the top 5% farthest from centroid
+    pct = 95
+    threshold = np.percentile(dists, pct)
+    extreme_mask = dists >= threshold
+    extremes_df = df[extreme_mask]
+
+    print(f"{extremes_df.shape[0]} samples ≥ {pct}th percentile distance out of {df.shape[0]} samples")
+
+    df["dist"]               = dists
+    df["is_latent_extreme"]  = extreme_mask
+
+    # ─── 4. WITHIN- vs BETWEEN-SUBJECT DISTANCES ─────────────────────────────
+    # Within‐subject
+    within_d = []
+    for sid, group in df.groupby("subject_id"):
+        Xi = scaler.transform(group[latent_cols].values)
+        for i in range(len(Xi)):
+            for j in range(i + 1, len(Xi)):
+                within_d.append(np.linalg.norm(Xi[i] - Xi[j]))
+
+    # Between‐subject (sample a subset if too big)
+    between_d = []
+    all_X = X_norm
+    all_subj = subjects
+    n = len(all_X)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if all_subj[i] != all_subj[j]:
+                between_d.append(np.linalg.norm(all_X[i] - all_X[j]))
+    # (You can random.sample for speed if n is very large)
+
+    # ─── 5. PLOT BOXPLOT COMPARISON ─────────────────────────────────────────
+    plt.figure(figsize=(6,4))
+    plt.boxplot([within_d, between_d], labels=["Within-Subj", "Between-Subj"])
+    plt.ylabel("Euclidean distance")
+    plt.title("Within vs Between Subject Latent Distances")
+    plt.tight_layout()
+    plt.savefig('euclidean_distances_within_between_latent_distances.png')
+
+    # ─── 6. AGE-DIFFERENCE vs LATENT DISTANCE ────────────────────────────────
+    age_diff = []
+    dist_vals = []
+    for sid, group in df.groupby("subject_id"):
+        Xi = scaler.transform(group[latent_cols].values)
+        ai = group["age"].astype(float).values * 6
+        for i in range(len(Xi)):
+            for j in range(i + 1, len(Xi)):
+                age_diff.append(abs(ai[i] - ai[j]))
+                dist_vals.append(np.linalg.norm(Xi[i] - Xi[j]))
+
+    plt.figure(figsize=(6,4))
+    plt.scatter(age_diff, dist_vals, alpha=0.6)
+    plt.xlabel("Age difference (years)")
+    plt.ylabel("Latent‐space distance")
+    plt.title("Within‐Subject Distance vs Age Gap")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig('age_difference_vs_latent_distance.png')
+
+    # ─── 7. t-SNE VISUALIZATION COLORED BY SUBJECT ───────────────────────────
+    tsne = TSNE(n_components=2, random_state=42)
+    emb = tsne.fit_transform(X_norm)
+
+    # map each subject_id to an integer color
+    subj_to_idx = {s: i for i, s in enumerate(np.unique(subjects))}
+    colors = [subj_to_idx[s] for s in subjects]
+
+    plt.figure(figsize=(6,6))
+    plt.scatter(emb[:,0], emb[:,1], c=colors, cmap="tab20", s=15, alpha=0.8)
+    plt.title("t-SNE of All Latents (colored by subject)")
+    plt.xticks([]); plt.yticks([])
+    plt.tight_layout()
+    plt.savefig('tsne_by_subject.png')
+
+    # ─── 8. SAVE EXTREMES FOR REVIEW ─────────────────────────────────────────
+    # extremes_df.to_csv("latents_extremes.csv", index=False)
+    # print("Saved extremes to latents_extremes.csv")
+    # save just the columns you care about for downstream use
+    out_cols = ["subject_id", "image_uid", "age", "sex",
+                "dist", "is_latent_extreme"] + latent_cols
+    df[out_cols].to_csv("latents_extremes.csv", index=False)
+
 if __name__ == '__main__':
 
     # # === CONFIG ===
@@ -517,7 +631,7 @@ if __name__ == '__main__':
     ## === LDA ANALYSIS ===
     # create_LDA_plot("/home/andim/projects/def-bedelb/andim/brlp-data/merged_latents.csv", "latent_lda_diagnosis.png")
     # train_and_plot_LDA("/home/andim/projects/def-bedelb/andim/brlp-data/merged_latents.csv", "latent_lda_diagnosis_test_solver.png")
-    train_and_plot_LDA_CV("/home/andim/projects/def-bedelb/andim/brlp-data/merged_latents.csv", "latent_lda_diagnosis_CV.png")
+    # train_and_plot_LDA_CV("/home/andim/projects/def-bedelb/andim/brlp-data/merged_latents.csv", "latent_lda_diagnosis_CV.png")
     
     ## === TSNE ANALYSIS ===
     # create_tsne_plot("/home/andim/projects/def-bedelb/andim/brlp-data/latent_trajectories_full.csv", variable="age", output_fig_name="latent_tsne_age.png")
@@ -529,6 +643,154 @@ if __name__ == '__main__':
     # mean_output_path="/home/andim/projects/def-bedelb/andim/brlp-data/latent_mean.npy",
     # std_output_path="/home/andim/projects/def-bedelb/andim/brlp-data/latent_std.npy"
     # )
+
+    ## === BETWEEN AND WITHIN SUBJECT DISTANCES ANALYSIS ===
+    csv_path="/home/andim/projects/def-bedelb/andim/brlp-data/merged_latents.csv"
+    analyze_within_between_latent_distances(csv_path)
+
+    ## === COMPARE RELATIONSHIP BETWEEN LATENT DISTANCES AND VOLUME MEASURES ===
+    # --- 1) Load and merge data ---
+    latents = pd.read_csv("latents_extremes.csv")      # has 'dist' and 'is_latent_extreme'
+    vols    = pd.read_csv("/home/andim/projects/def-bedelb/andim/brlp-data/healthy_shape_features.csv")
+    df = pd.merge(latents, vols, on=["subject_id","image_uid"], how="inner")
+
+    # --- 2) Identify and combine volumetric regions (exclude background) ---
+    vol_cols = [c for c in df.columns if c.endswith("__volume_mm3") and not c.startswith("background")]
+    regions = sorted({c.split("__volume_mm3")[0].replace("left_","").replace("right_","") 
+                    for c in vol_cols})
+
+    for region in regions:
+        left  = f"left_{region}__volume_mm3"
+        right = f"right_{region}__volume_mm3"
+        if left in df.columns and right in df.columns:
+            df[f"{region}__volume_mm3"] = df[left] + df[right]
+
+    region_cols = [f"{r}__volume_mm3" for r in regions if f"{r}__volume_mm3" in df.columns]
+
+    # --- 3) Compute 95th percentile thresholds ---
+    dist95   = np.percentile(df["dist"], 95)
+    vol_pcts = {col: np.percentile(df[col], [5,95]) for col in region_cols}
+
+    # --- 4) Build interactive Plotly figure ---
+    fig = go.Figure()
+
+    # Add single scatter trace (we will update its y-data on dropdown)
+    fig.add_trace(go.Scatter(
+        x=df["dist"],
+        y=df[region_cols[0]],
+        mode="markers",
+        marker=dict(color=df["is_latent_extreme"].map({False:"gray", True:"red"})),
+        name=region_cols[0]
+    ))
+
+    # Helper to make threshold lines for a given volume column
+    def make_shapes(vol_col):
+        _, high = vol_pcts[vol_col]
+        return [
+            # vertical: latent-space 95th cutoff
+            dict(type="line", x0=dist95, x1=dist95,
+                y0=df[vol_col].min(), y1=df[vol_col].max(),
+                line=dict(color="red", dash="dash")),
+            # horizontal: volume 95th cutoff
+            dict(type="line", x0=df["dist"].min(), x1=df["dist"].max(),
+                y0=high, y1=high,
+                line=dict(color="blue", dash="dash")),
+        ]
+
+    # Initial shapes for first region
+    fig.update_layout(
+        shapes=make_shapes(region_cols[0]),
+        xaxis_title="Latent‐space distance",
+        yaxis_title=region_cols[0],
+        updatemenus=[dict(
+            buttons=[
+                dict(
+                    label=col,
+                    method="update",
+                    args=[
+                        {"y": [df[col]]},                # update scatter y
+                        {"shapes": make_shapes(col),     # update threshold lines
+                        "yaxis": {"title": col}}        # update y-axis label
+                    ]
+                )
+                for col in region_cols
+            ],
+            direction="down",
+            x=1.15,
+            y=1,
+            showactive=True
+        )]
+    )
+
+    fig.write_html(
+    "latent_distances_vs_volume_interactive.html",
+    include_plotlyjs="cdn",    # embeds Plotly.js via CDN; or use "cdn"
+    full_html=True             # writes a complete HTML document
+    )
+    # # 1) Load your two tables
+    # latents = pd.read_csv("latents_extremes.csv")            # contains your 'dists' and extreme_mask
+    # vols    = pd.read_csv("/home/andim/projects/def-bedelb/andim/brlp-data/healthy_shape_features.csv")
+
+    # # 2) Merge on subject & image
+    # df = pd.merge(latents, vols,
+    #             on=["subject_id","image_uid"],
+    #             how="inner")
+
+    # # 3) Pick one volume metric and define extremes
+    # vol_col = "left_cerebral_white_matter__volume_mm3"
+    # low, high = np.percentile(df[vol_col], [5,95])
+    # df["is_vol_extreme"] = (
+    #     (df[vol_col] <= low)
+    #     | (df[vol_col] >= high)
+    # )
+
+    # # 4) Build a confusion table
+    # ct = pd.crosstab(df["is_latent_extreme"], df["is_vol_extreme"],
+    #                 rownames=["latent extreme"], colnames=["volume extreme"])
+    # print(ct)
+
+    # # 5) Quantify overlap
+    # n_both   = ct.loc[True, True]
+    # n_latent = df["is_latent_extreme"].sum()
+    # print(f"{n_both} of {n_latent} latent‐extreme samples are also volume‐extreme")
+
+    # # 6) Visualize
+
+    # # assume df, dist, and high are already defined:
+    # v95 = np.percentile(df["dist"], 95)
+    # h95 = high  # your 95th‐percentile volume
+
+    # fig, ax = plt.subplots(figsize=(6,4))
+
+    # # scatter
+    # ax.scatter(df["dist"], df[vol_col],
+    #         c=df["is_latent_extreme"].map({False:"gray", True:"red"}),
+    #         alpha=0.6)
+
+    # # 95th‐percentile lines
+    # ax.axvline(v95, linestyle="--", color="red")
+    # ax.axhline(h95, linestyle="--", color="blue")
+
+    # # annotate the lines
+    # # for the vertical line, place text at the top of the plot
+    # ax.text(v95, ax.get_ylim()[1],
+    #         f"{v95:.1f}", color="red",
+    #         ha="right", va="bottom")
+
+    # # for the horizontal line, place text at the left of the plot
+    # ax.text(ax.get_xlim()[0], h95,
+    #         f"{h95:.0f}", color="blue",
+    #         ha="left", va="bottom")
+
+    # # labels and title
+    # ax.set_xlabel("Latent‐space distance")
+    # ax.set_ylabel(vol_col)             # ensure this label is fully visible
+    # ax.set_title("Latent distance vs. volume")
+
+    # # ensure no clipping of labels
+    # fig.tight_layout()
+    # plt.savefig("cerebral_WM_volume_extremes_scatter.png")
+    
 
 
 
