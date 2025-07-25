@@ -1,8 +1,7 @@
 import os
 import argparse
 import csv
-import wandb
-import matplotlib.pyplot as plt
+
 import torch
 import torch.nn.functional as F
 import pandas as pd
@@ -37,70 +36,6 @@ def concat_covariates(_dict):
     _dict['context'] = torch.tensor([ _dict[c] for c in const.CONDITIONING_VARIABLES ]).unsqueeze(0)
     return _dict
 
-def make_orthogonal_montage(image: torch.Tensor) -> plt.Figure:
-    """
-    Given a 3D tensor (D,H,W), returns a matplotlib Figure
-    showing the three center slices (sagittal, coronal, axial).
-    """
-    # ensure image is CPU numpy for plotting
-    if image.ndim == 4 and image.shape[0] == 1:
-        image = image.squeeze(0)
-    D, H, W = image.shape
-
-    mids = [D//2, H//2, W//2]
-
-    plt.style.use('dark_background')
-    fig, axes = plt.subplots(ncols=3, figsize=(7, 3))
-    for ax in axes:
-        ax.axis('off')
-
-    axes[0].imshow(image[mids[0], :, :].cpu(), cmap='gray')
-    axes[1].imshow(image[:, mids[1], :].cpu(), cmap='gray')
-    axes[2].imshow(image[:, :, mids[2]].cpu(), cmap='gray')
-    plt.tight_layout()
-    return fig
-
-def images_to_wandb(
-    epoch: int,
-    mode: str,
-    autoencoder,
-    diffusion,
-    scale_factor: float,
-    device: str = 'cuda'
-):
-    """
-    Sample 3 volumes at random age/sex, draw their 3‐view montage,
-    and log them all to wandb in one batch.
-    """
-    logs = {}
-    for i in range(3):
-        # 1) sample context
-        age = torch.randint(1, 7, (1,), device=device).float()
-        sex = torch.randint(0, 2, (1,), device=device).float()
-        age_norm = (age - const.AGE_MIN) / const.AGE_DELTA
-        sex_norm = (sex - const.SEX_MIN) / const.SEX_DELTA
-        context = torch.stack([age_norm, sex_norm], dim=1)  # [1,2]
-
-        # 2) generate a volume (D,H,W)
-        img = sample_using_diffusion(
-            autoencoder=autoencoder,
-            diffusion=diffusion,
-            context=context,
-            device=device,
-            scale_factor=scale_factor,
-            num_inference_steps=args.num_inf_steps,
-        )
-
-        # 3) build the figure
-        fig = make_orthogonal_montage(img)
-
-        # 4) log to wandb with a descriptive caption
-        caption = f"{mode} | age={int(age.item())}, sex={int(sex.item())}"
-        logs[f"{mode}/gen_{i}"] = wandb.Image(fig, caption=caption)
-
-        plt.close(fig)
-
-    wandb.log(logs)
 
 def images_to_tensorboard(
     writer,
@@ -130,11 +65,11 @@ def images_to_tensorboard(
         context = torch.tensor([[
             (torch.randint(1, 7, (1,)) - const.AGE_MIN) / const.AGE_DELTA,  # age 
             (torch.randint(1, 2,   (1,)) - const.SEX_MIN) / const.SEX_DELTA,  # sex
-            # 0.573, # (mean) cerebral cortex 
-            # 0.513, # (mean) hippocampus
-            # 0.508, # (mean) amygdala
-            # 0.474, # (mean) cerebral white matter
-            # 0.155 * (tag_i+1), # variable size lateral ventricles
+            0.573, # (mean) cerebral cortex 
+            0.513, # (mean) hippocampus
+            0.508, # (mean) amygdala
+            0.474, # (mean) cerebral white matter
+            0.155 * (tag_i+1), # variable size lateral ventricles
         ]])
 
         image = sample_using_diffusion(
@@ -165,18 +100,7 @@ if __name__ == '__main__':
     parser.add_argument('--n_epochs',    default=5,     type=int)
     parser.add_argument('--batch_size',  default=16,    type=int)
     parser.add_argument('--lr',          default=2.5e-5,  type=float)
-    parser.add_argument('--patience', type=int, default=15, help="number of epochs with no val‑loss improvement before stopping")
-    parser.add_argument('--min_epochs', type=int, default=200,
-    help="don’t start early‐stopping until you’ve run this many epochs")
-    parser.add_argument('--num_inf_steps', type=int, default=50, help="Number of inference steps for DDIM sampler at inference time")
     args = parser.parse_args()
-
-    wandb.init(
-    project="ldm-age-prediction",
-    config=vars(args),      # logs all CLI args as hyperparameters
-    mode="offline",         # records locally; you can later `wandb sync`
-    dir=args.output_dir     # where to write the wandb files
-    )
     
     npz_reader = NumpyReader(npz_keys=['data'])
     transforms_fn = transforms.Compose([
@@ -237,10 +161,6 @@ if __name__ == '__main__':
 
     all_losses = []
 
-    best_val_loss = float('inf')
-    epochs_no_improve = 0
-    patience = args.patience
-    min_epochs = args.min_epochs
 
     for epoch in range(args.n_epochs):
 
@@ -260,34 +180,45 @@ if __name__ == '__main__':
                 with autocast(enabled=True):    
                         
                     if mode == 'train': optimizer.zero_grad(set_to_none=True)
-                    latents = batch['latent'].to(DEVICE) * scale_factor
-                    context = batch['context'].to(DEVICE)
-                    n = latents.shape[0]
-                                                            
-                    with torch.set_grad_enabled(mode == 'train'):
-                        
-                        noise = torch.randn_like(latents).to(DEVICE)
-                        timesteps = torch.randint(0, scheduler.num_train_timesteps, (n,), device=DEVICE).long()
+                    # --- pull out baseline and follow‐up latents ---
+                    z1 = batch['latent_t1'].to(DEVICE) * scale_factor      # [B, C, D, H, W]
+                    z2 = batch['latent_t2'].to(DEVICE) * scale_factor      # [B, C, D, H, W]
+                    n  = z2.shape[0]
 
+                    # --- build context from target age (and any other const.CONDITIONING_VARIABLES) ---
+                    # e.g. if CONDITIONING_VARIABLES = ['age_t2','sex','dia',…] then:
+                    raw = [ batch[k] for k in const.CONDITIONING_VARIABLES ]
+                    # each raw[i] is shape [B], so stack → [num_vars, B] → transpose → [B, num_vars]
+                    context = torch.cat([context, z1.mean(dim=[2,3,4])], dim=1)           
+                    # (if age needs normalization, do it here: (age_t2 - AGE_MIN)/AGE_DELTA )
+
+                    with torch.set_grad_enabled(mode == 'train'):
+
+                        # --- forward‐diffuse the true follow‐up latent z2 ---
+                        noise     = torch.randn_like(z2)
+                        timesteps = torch.randint(0, scheduler.num_train_timesteps, (n,), device=DEVICE).long()
+                        x_t       = scheduler.add_noise(z2, noise, timesteps)
+
+                        # --- predict that noise (conditioned on age2 ± z1 if you choose) ---
+                        # If you also want to give the network z1, you can concatenate it
+                        # into the context or feed it as a separate cross‐attention key.
                         noise_pred = inferer(
-                            inputs=latents, 
-                            diffusion_model=diffusion, 
-                            noise=noise, 
+                            inputs=x_t,                       # already scaled
+                            diffusion_model=diffusion,
                             timesteps=timesteps,
-                            condition=context,
+                            condition=context,                # [B, num_vars]
                             mode='crossattn'
                         )
 
-                        loss = F.mse_loss( noise.float(), noise_pred.float() )
+                        # --- classic LDM loss ---
+                        loss = F.mse_loss(noise_pred.float(), noise.float())
 
                 if mode == 'train':
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
                     scaler.update()
                     
-                # writer.add_scalar(f'{mode}/batch-mse', loss.item(), global_counter[mode])
-                wandb.define_metric(f"{mode}/epoch_mse", step_metric="epoch")
-                wandb.log({"epoch": epoch, f"{mode}/epoch_mse": epoch_loss})
+                writer.add_scalar(f'{mode}/batch-mse', loss.item(), global_counter[mode])
                 epoch_loss += loss.item()
                 progress_bar.set_postfix({"loss": epoch_loss / (step + 1)})
                 global_counter[mode] += 1
@@ -298,47 +229,17 @@ if __name__ == '__main__':
             epoch_losses[mode] = epoch_loss
             epoch_steps[mode] = len(loader)
 
-            # writer.add_scalar(f'{mode}/epoch-mse', epoch_loss, epoch)
-            # wandb.log({f"{mode}/epoch_mse": epoch_loss}, step=epoch)
-            wandb.define_metric(f"{mode}/epoch_mse", step_metric="epoch")
-            wandb.log({"epoch": epoch, f"{mode}/epoch_mse": epoch_loss})
+            writer.add_scalar(f'{mode}/epoch-mse', epoch_loss, epoch)
 
             # visualize results
-            # images_to_tensorboard(
-            #     writer=writer, 
-            #     epoch=epoch, 
-            #     mode=mode, 
-            #     autoencoder=autoencoder, 
-            #     diffusion=diffusion, 
-            #     scale_factor=scale_factor
-            # )
-            images_to_wandb(
-                epoch,
-                mode,
-                autoencoder,
-                diffusion,
-                scale_factor,
-                device='cuda'
+            images_to_tensorboard(
+                writer=writer, 
+                epoch=epoch, 
+                mode=mode, 
+                autoencoder=autoencoder, 
+                diffusion=diffusion, 
+                scale_factor=scale_factor
             )
-
-        val_loss = epoch_losses['valid']
-        if val_loss < best_val_loss:
-            best_val_loss    = val_loss
-            epochs_no_improve = 0
-            # Optionally save your best‐so‐far model
-            best_path = os.path.join(args.output_dir, 'best‑unet.pth')
-            torch.save(diffusion.state_dict(), best_path)
-            print(f"[Epoch {epoch}] New best val loss: {val_loss:.4f}, saving to {best_path}")
-        else:
-            # only start counting “no improve” *after* min_epochs
-            if epoch >= min_epochs:
-                epochs_no_improve += 1
-                print(f"[Epoch {epoch}] No improvement in {epochs_no_improve}/{patience}")
-
-        # Check early‐stop criterion
-        if epoch >= min_epochs and epochs_no_improve >= patience:
-            print(f"Stopping early at epoch {epoch}. Best val loss: {best_val_loss:.4f}")
-            break
 
         all_losses.append({
         'epoch': epoch,
@@ -361,5 +262,3 @@ if __name__ == '__main__':
             if write_header:
                 csv_writer.writeheader()
             csv_writer.writerow(all_losses[-1])
-        
-    wandb.finish()

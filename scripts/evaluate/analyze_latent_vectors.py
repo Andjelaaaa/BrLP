@@ -10,7 +10,9 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 import matplotlib.cm as cm
-# import seaborn as sns
+import statsmodels.formula.api as smf
+from scipy.stats import spearmanr
+import seaborn as sns
 from sklearn.metrics import classification_report, accuracy_score
 from sklearn.model_selection import StratifiedKFold
 from collections import Counter
@@ -496,7 +498,7 @@ def create_latent_csv(csv_paths, output_csv_path):
     latent_df.to_csv(output_csv_path, index=False)
     print(f"✅ Merged latent vectors saved to: {output_csv_path}")
 
-def analyze_within_between_latent_distances(csv_path):
+def analyze_within_between_latent_distances(csv_path, nbr_clusters):
     # ─── 1. LOAD DATA ────────────────────────────────────────────────────────
     # Replace with your actual path
     df = pd.read_csv(csv_path)
@@ -517,7 +519,7 @@ def analyze_within_between_latent_distances(csv_path):
     X_norm = scaler.fit_transform(X)
 
     # ─── 3. K-MEANS & EXTREME VECTORS ───────────────────────────────────────
-    k = 3  # choose # clusters you like
+    k = nbr_clusters  # choose # clusters you like
     kmeans = KMeans(n_clusters=k, random_state=42)
     labels = kmeans.fit_predict(X_norm)
     centers = kmeans.cluster_centers_
@@ -535,6 +537,66 @@ def analyze_within_between_latent_distances(csv_path):
 
     df["dist"]               = dists
     df["is_latent_extreme"]  = extreme_mask
+
+    # ─── Compute per‐subject scan counts ─────────────────────────────────
+    # (counts the number of rows / image_uid per subject)
+    df["n_images"] = df.groupby("subject_id")["image_uid"].transform("count")
+    print(df.head(10))
+
+     # ─── Plot scatter: number of scans vs. relative distance ──────────────
+    plt.figure(figsize=(6,4))
+    sc = plt.scatter(
+        df["n_images"],
+        df["dist"],
+        c=df["age"]*6,          # optional: color‐code by age
+        cmap="viridis",
+        alpha=0.6,
+        s=30
+    )
+    plt.colorbar(sc, label="Age (years)")
+    plt.xlabel("Number of scans for that subject")
+    plt.ylabel("Relative distance to cluster centroid")
+    plt.title("Scan‐count vs. Relative Latent‐Space Distance")
+    plt.tight_layout()
+    plt.savefig('nbr_scans_vs_dist_to_centroid.png')
+
+    # 1) collapse to one row per subject
+    subj_df = (
+        df
+        .groupby("subject_id")
+        .agg(n_images = ("n_images","first"),
+            mean_dist = ("dist","mean"),
+            median_dist = ("dist","median"))
+        .reset_index()
+    )
+
+    # 2) scatter plot: #scans vs. mean distance
+    plt.figure(figsize=(6,4))
+    plt.scatter(subj_df["n_images"], subj_df["mean_dist"], alpha=0.7)
+    plt.xlabel("Number of scans per subject")
+    plt.ylabel("Mean distance to cluster centroid")
+    plt.title("Scan count vs. mean latent‐space distance")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("scan_count_vs_mean_latent_dist.png")
+
+    # 3) compute nonparametric correlation
+    rho, pval = spearmanr(subj_df["n_images"], subj_df["mean_dist"])
+    print(f"Spearman ρ = {rho:.2f}, p = {pval:.3f}")
+
+    plt.figure(figsize=(8,4))
+
+    sns.boxplot(
+        data=subj_df,
+        x="n_images",
+        y="mean_dist",
+        order=sorted(subj_df["n_images"].unique())
+    )
+    plt.xlabel("Number of scans per subject")
+    plt.ylabel("Mean distance to cluster centroid")
+    plt.title("Latent‐space stability vs. longitudinal sample size")
+    plt.tight_layout()
+    plt.savefig("boxplot_scan_group_count.png")
 
     # ─── 4. WITHIN- vs BETWEEN-SUBJECT DISTANCES ─────────────────────────────
     # Within‐subject
@@ -605,7 +667,377 @@ def analyze_within_between_latent_distances(csv_path):
     # save just the columns you care about for downstream use
     out_cols = ["subject_id", "image_uid", "age", "sex",
                 "dist", "is_latent_extreme"] + latent_cols
-    df[out_cols].to_csv("latents_extremes.csv", index=False)
+    df[out_cols].to_csv(f"latents_extremes_k_{nbr_clusters}.csv", index=False)
+
+def LME_model_latent_age(csv_input):
+
+    # === Load the merged latents + metadata ===
+    df = pd.read_csv(csv_input)       # contains latent dims, age, subject_id
+    # If needed, merge with vols too, but age and subject_id must be present.
+    # df = pd.merge(df, pd.read_csv("healthy_shape_features.csv"), on=["subject_id","image_uid"])
+
+    # Identify latent dimensions
+    latent_cols = [c for c in df.columns if c.startswith("latent_")]
+    
+    df["age_c"] = df["age"] - df["age"].mean()
+    results = {}
+
+    for dim in latent_cols:
+        df[dim] = (df[dim] - df[dim].mean()) / df[dim].std()
+        formula = f"{dim} ~ age_c"
+        md = smf.mixedlm(formula, df,
+                        groups=df["subject_id"],
+                        re_formula="~age_c")
+        try:
+            mdf = md.fit(reml=False,
+                        method='bfgs',
+                        maxiter=6000,
+                        full_output=True,
+                        disp=False)
+            # check covariance eigenvalues
+            eigs = np.linalg.eigvals(mdf.cov_re)
+            if np.min(eigs) < 1e-6:
+                raise ValueError("singular cov_re")
+        except Exception:
+            # fallback to random intercept only
+            md_simple = smf.mixedlm(formula, df,
+                                    groups=df["subject_id"],
+                                    re_formula="1")
+            mdf = md_simple.fit()
+            print(f"Fell back to intercept‐only for {dim}")
+
+        results[dim] = mdf
+        print(f"=== Results for {dim} ===")
+        print(mdf.summary())
+        print("Random effects cov:\n", mdf.cov_re)
+        print("-" * 80)
+
+    re = mdf.random_effects
+    for subj, coef in re.items():
+        intercept = coef['Group']
+        slope = coef['age']
+        ages = np.linspace(df['age'].min(), df['age'].max(), 10)
+        plt.plot(ages, intercept + slope*ages, color='gray', alpha=0.5)
+    plt.scatter(df['age'], df[dim], c='C1'); plt.xlabel('Age'); plt.ylabel(dim)
+    plt.savefig('LME_individual_latent_trajectories.png')
+
+def plot_extremes_latent_volumes_with_age(latents, vols):
+    # Drop age in one so that it remains in the merged version
+    vols = vols.drop(columns="age")
+    df = pd.merge(latents, vols, on=["subject_id","image_uid"], how="inner")
+
+    # --- 2) Identify and combine volumetric regions (exclude background) ---
+    vol_cols = [c for c in df.columns if c.endswith("__volume_mm3") and not c.startswith("background")]
+    regions = sorted({c.split("__volume_mm3")[0].replace("left_","").replace("right_","") 
+                    for c in vol_cols})
+
+    for region in regions:
+        left  = f"left_{region}__volume_mm3"
+        right = f"right_{region}__volume_mm3"
+        if left in df.columns and right in df.columns:
+            df[f"{region}__volume_mm3"] = df[left] + df[right]
+
+    region_cols = [f"{r}__volume_mm3" for r in regions if f"{r}__volume_mm3" in df.columns]
+
+    # === 3) Compute 95th percentile thresholds & stats ===
+    dist95 = np.percentile(df["dist"], 95)
+    vol_pcts = {col: np.percentile(df[col], [5, 95]) for col in region_cols}
+    region_stats = {}
+    for col in region_cols:
+        low, high = vol_pcts[col]
+        is_vol_ext = (df[col] <= low) | (df[col] >= high)
+        ct = pd.crosstab(df["is_latent_extreme"], is_vol_ext)
+        n_both = int(ct.loc[True, True]) if True in ct.index and True in ct.columns else 0
+        n_latent = int(df["is_latent_extreme"].sum())
+        region_stats[col] = (n_both, n_latent)
+
+    # --- 4) Build interactive Plotly figure ---
+    fig = go.Figure()
+
+    # Initial region
+    init_col = region_cols[0]
+    low0, high0 = vol_pcts[init_col]
+    n_both0, n_latent0 = region_stats[init_col]
+    title0 = f"{n_both0} of {n_latent0} latent‐extreme samples are also volume‐extreme ({init_col})"
+
+    # Scatter trace colored by age
+    fig.add_trace(go.Scatter(
+        x=df["dist"], y=df[init_col],
+        mode="markers",
+        marker=dict(
+            size=8,
+            color=df["age"]*6,              # color by age
+            colorscale="Viridis",
+            showscale=True,
+            colorbar=dict(title="Age (years)")
+        )
+    ))
+
+    # Latent 95th percentile line
+    fig.add_trace(go.Scatter(
+        x=[dist95, dist95],
+        y=[df[init_col].min(), df[init_col].max()],
+        mode="lines",
+        line=dict(color="red", dash="dash"),
+        name=f"Latent distances 95th pct ({dist95:.1f})"
+    ))
+    # Volume 95th percentile line
+    fig.add_trace(go.Scatter(
+        x=[df["dist"].min(), df["dist"].max()],
+        y=[high0, high0],
+        mode="lines",
+        line=dict(color="blue", dash="dash"),
+        name=f"{init_col} 95th pct ({high0:.0f})"
+    ))  
+
+    fig.data[0].marker.colorbar.update({
+    "x": 1.05,       # move it further right of the plotting area
+    "y": 0.45,        # center vertically
+    "len": 0.8,      # adjust height
+    "thickness": 20  # adjust width
+    })
+
+    steps = []
+    for col in region_cols:
+        low, high = vol_pcts[col]
+        n_both, n_latent = region_stats[col]
+        step_title = f"{n_both} of {n_latent} latent‐extreme samples are also volume‐extreme ({col})"
+
+        steps.append(dict(
+            method="update",
+            args=[
+                {
+                    # update data
+                    "x": [
+                        df["dist"],                         # scatter x
+                        [dist95, dist95],                   # latent line x
+                        [df["dist"].min(), df["dist"].max()]# volume line x
+                    ],
+                    "y": [
+                        df[col],                            # scatter y
+                        [df[col].min(), df[col].max()],     # latent line y
+                        [high, high]                        # volume line y
+                    ],
+                    # **update trace names** for legend
+                    "name": [
+                        "Samples",
+                        f"Latent distances 95th pct ({dist95:.1f})",
+                        f"{col} 95th pct ({high:.0f})"
+                    ]
+                },
+                {
+                    # update layout
+                    "yaxis": {"title": col},
+                    "title.text": step_title
+                }
+            ],
+            label=col
+        ))
+
+    fig.update_layout(
+    title_text=title0,
+    xaxis_title="Latent‐space distance",
+    yaxis_title=init_col,
+    sliders=[dict(
+        active=0,
+        currentvalue={"prefix": "Region: "},
+        pad={"t": 50},
+        steps=steps
+    )]
+    )
+
+    # === 5) Save to HTML ===
+    fig.write_html(
+        "latent_vs_volume_slider_with_age.html",
+        include_plotlyjs="cdn",
+        full_html=True
+    )
+
+def plot_extremes_latent_volumes(latents, vols):
+    # Drop age in one so that it remains in the merged version
+    vols = vols.drop(columns="age")
+    df = pd.merge(latents, vols, on=["subject_id","image_uid"], how="inner")
+
+    # --- 2) Identify and combine volumetric regions (exclude background) ---
+    vol_cols = [c for c in df.columns if c.endswith("__volume_mm3") and not c.startswith("background")]
+    regions = sorted({c.split("__volume_mm3")[0].replace("left_","").replace("right_","") 
+                    for c in vol_cols})
+
+    for region in regions:
+        left  = f"left_{region}__volume_mm3"
+        right = f"right_{region}__volume_mm3"
+        if left in df.columns and right in df.columns:
+            df[f"{region}__volume_mm3"] = df[left] + df[right]
+
+    region_cols = [f"{r}__volume_mm3" for r in regions if f"{r}__volume_mm3" in df.columns]
+
+    # === 3) Compute 95th percentile thresholds & stats ===
+    dist95 = np.percentile(df["dist"], 95)
+    vol_pcts = {col: np.percentile(df[col], [5, 95]) for col in region_cols}
+    region_stats = {}
+    for col in region_cols:
+        low, high = vol_pcts[col]
+        is_vol_ext = (df[col] <= low) | (df[col] >= high)
+        ct = pd.crosstab(df["is_latent_extreme"], is_vol_ext)
+        n_both = int(ct.loc[True, True]) if True in ct.index and True in ct.columns else 0
+        n_latent = int(df["is_latent_extreme"].sum())
+        region_stats[col] = (n_both, n_latent)
+
+    # --- 4) Build interactive Plotly figure ---
+    fig = go.Figure()
+
+    # Initial region
+    init_col = region_cols[0]
+    low0, high0 = vol_pcts[init_col]
+    n_both0, n_latent0 = region_stats[init_col]
+    title0 = f"{n_both0} of {n_latent0} latent‐extreme samples are also volume‐extreme ({init_col})"
+
+    # Scatter trace
+    fig.add_trace(go.Scatter(
+        x=df["dist"], y=df[init_col],
+        mode="markers",
+        marker=dict(color=df["is_latent_extreme"].map({False: "gray", True: "red"})),
+        name="Samples"
+    ))
+
+    # Latent 95th percentile line
+    fig.add_trace(go.Scatter(
+        x=[dist95, dist95],
+        y=[df[init_col].min(), df[init_col].max()],
+        mode="lines",
+        line=dict(color="red", dash="dash"),
+        name=f"Latent distances 95th pct ({dist95:.1f})"
+    ))
+    # Volume 95th percentile line
+    fig.add_trace(go.Scatter(
+        x=[df["dist"].min(), df["dist"].max()],
+        y=[high0, high0],
+        mode="lines",
+        line=dict(color="blue", dash="dash"),
+        name=f"{init_col} 95th pct ({high0:.0f})"
+    ))  
+
+    steps = []
+    for col in region_cols:
+        low, high = vol_pcts[col]
+        # boolean masks for this region
+        is_vol_ext = (df[col] <= low) | (df[col] >= high)
+        is_lat    = df["is_latent_extreme"]
+        
+        # build a color array: purple if both, red if latent-only, gray otherwise
+        colors = np.where(is_lat & is_vol_ext, "purple",
+                np.where(is_lat,              "red",    
+                        "gray"))
+
+        n_both, n_latent = region_stats[col]
+        title = f"{n_both} of {n_latent} latent‐extreme samples are also volume‐extreme ({col})"
+
+        steps.append(dict(
+            method="update",
+            args=[
+                {
+                    "x": [
+                        df["dist"],                           # scatter
+                        [dist95, dist95],                     # latent cutoff line
+                        [df["dist"].min(), df["dist"].max()]  # volume cutoff line
+                    ],
+                    "y": [
+                        df[col],                              # scatter
+                        [df[col].min(), df[col].max()],       # latent cutoff line
+                        [high, high]                          # volume cutoff line
+                    ],
+                    # update only trace 0’s marker colors
+                    "marker.color": [colors, None, None]
+                },
+                {
+                    "yaxis": {"title": col},
+                    "title.text": title
+                }
+            ],
+            label=col
+        ))
+
+    # Add slider
+    fig.update_layout(
+        title_text=title0,
+        xaxis_title="Latent‐space distance",
+        yaxis_title=init_col,
+        sliders=[dict(
+            active=0,
+            currentvalue={"prefix": "Region: "},
+            pad={"t": 50},
+            steps=steps
+        )]
+    )
+
+    # === 5) Save to HTML ===
+    fig.write_html(
+        "latent_vs_volume_slider_with_age.html",
+        include_plotlyjs="cdn",
+        full_html=True
+    )
+
+def plot_extremes_latent_vols_one_region(latents, vols, region):
+    # 2) Merge on subject & image
+    df = pd.merge(latents, vols,
+                on=["subject_id","image_uid"],
+                how="inner")
+
+    # 3) Pick one volume metric and define extremes
+    vol_col = region # ex: "left_cerebral_white_matter__volume_mm3"
+    low, high = np.percentile(df[vol_col], [5,95])
+    df["is_vol_extreme"] = (
+        (df[vol_col] <= low)
+        | (df[vol_col] >= high)
+    )
+
+    # 4) Build a confusion table
+    ct = pd.crosstab(df["is_latent_extreme"], df["is_vol_extreme"],
+                    rownames=["latent extreme"], colnames=["volume extreme"])
+    print(ct)
+
+    # 5) Quantify overlap
+    n_both   = ct.loc[True, True]
+    n_latent = df["is_latent_extreme"].sum()
+    print(f"{n_both} of {n_latent} latent‐extreme samples are also volume‐extreme")
+
+    # 6) Visualize
+
+    # assume df, dist, and high are already defined:
+    v95 = np.percentile(df["dist"], 95)
+    h95 = high  # your 95th‐percentile volume
+
+    fig, ax = plt.subplots(figsize=(6,4))
+
+    # scatter
+    ax.scatter(df["dist"], df[vol_col],
+            c=df["is_latent_extreme"].map({False:"gray", True:"red"}),
+            alpha=0.6)
+
+    # 95th‐percentile lines
+    ax.axvline(v95, linestyle="--", color="red")
+    ax.axhline(h95, linestyle="--", color="blue")
+
+    # annotate the lines
+    # for the vertical line, place text at the top of the plot
+    ax.text(v95, ax.get_ylim()[1],
+            f"{v95:.1f}", color="red",
+            ha="right", va="bottom")
+
+    # for the horizontal line, place text at the left of the plot
+    ax.text(ax.get_xlim()[0], h95,
+            f"{h95:.0f}", color="blue",
+            ha="left", va="bottom")
+
+    # labels and title
+    ax.set_xlabel("Latent‐space distance")
+    ax.set_ylabel(vol_col)             # ensure this label is fully visible
+    ax.set_title("Latent distance vs. volume")
+
+    # ensure no clipping of labels
+    fig.tight_layout()
+    plt.savefig(f"{region}_extremes_scatter.png")
+    
 
 if __name__ == '__main__':
 
@@ -646,153 +1078,16 @@ if __name__ == '__main__':
 
     ## === BETWEEN AND WITHIN SUBJECT DISTANCES ANALYSIS ===
     csv_path="/home/andim/projects/def-bedelb/andim/brlp-data/merged_latents.csv"
-    analyze_within_between_latent_distances(csv_path)
+    k = 1
+    analyze_within_between_latent_distances(csv_path, nbr_clusters=k)
 
     ## === COMPARE RELATIONSHIP BETWEEN LATENT DISTANCES AND VOLUME MEASURES ===
     # --- 1) Load and merge data ---
-    latents = pd.read_csv("latents_extremes.csv")      # has 'dist' and 'is_latent_extreme'
-    vols    = pd.read_csv("/home/andim/projects/def-bedelb/andim/brlp-data/healthy_shape_features.csv")
-    df = pd.merge(latents, vols, on=["subject_id","image_uid"], how="inner")
-
-    # --- 2) Identify and combine volumetric regions (exclude background) ---
-    vol_cols = [c for c in df.columns if c.endswith("__volume_mm3") and not c.startswith("background")]
-    regions = sorted({c.split("__volume_mm3")[0].replace("left_","").replace("right_","") 
-                    for c in vol_cols})
-
-    for region in regions:
-        left  = f"left_{region}__volume_mm3"
-        right = f"right_{region}__volume_mm3"
-        if left in df.columns and right in df.columns:
-            df[f"{region}__volume_mm3"] = df[left] + df[right]
-
-    region_cols = [f"{r}__volume_mm3" for r in regions if f"{r}__volume_mm3" in df.columns]
-
-    # --- 3) Compute 95th percentile thresholds ---
-    dist95   = np.percentile(df["dist"], 95)
-    vol_pcts = {col: np.percentile(df[col], [5,95]) for col in region_cols}
-
-    # --- 4) Build interactive Plotly figure ---
-    fig = go.Figure()
-
-    # Add single scatter trace (we will update its y-data on dropdown)
-    fig.add_trace(go.Scatter(
-        x=df["dist"],
-        y=df[region_cols[0]],
-        mode="markers",
-        marker=dict(color=df["is_latent_extreme"].map({False:"gray", True:"red"})),
-        name=region_cols[0]
-    ))
-
-    # Helper to make threshold lines for a given volume column
-    def make_shapes(vol_col):
-        _, high = vol_pcts[vol_col]
-        return [
-            # vertical: latent-space 95th cutoff
-            dict(type="line", x0=dist95, x1=dist95,
-                y0=df[vol_col].min(), y1=df[vol_col].max(),
-                line=dict(color="red", dash="dash")),
-            # horizontal: volume 95th cutoff
-            dict(type="line", x0=df["dist"].min(), x1=df["dist"].max(),
-                y0=high, y1=high,
-                line=dict(color="blue", dash="dash")),
-        ]
-
-    # Initial shapes for first region
-    fig.update_layout(
-        shapes=make_shapes(region_cols[0]),
-        xaxis_title="Latent‐space distance",
-        yaxis_title=region_cols[0],
-        updatemenus=[dict(
-            buttons=[
-                dict(
-                    label=col,
-                    method="update",
-                    args=[
-                        {"y": [df[col]]},                # update scatter y
-                        {"shapes": make_shapes(col),     # update threshold lines
-                        "yaxis": {"title": col}}        # update y-axis label
-                    ]
-                )
-                for col in region_cols
-            ],
-            direction="down",
-            x=1.15,
-            y=1,
-            showactive=True
-        )]
-    )
-
-    fig.write_html(
-    "latent_distances_vs_volume_interactive.html",
-    include_plotlyjs="cdn",    # embeds Plotly.js via CDN; or use "cdn"
-    full_html=True             # writes a complete HTML document
-    )
-    # # 1) Load your two tables
-    # latents = pd.read_csv("latents_extremes.csv")            # contains your 'dists' and extreme_mask
-    # vols    = pd.read_csv("/home/andim/projects/def-bedelb/andim/brlp-data/healthy_shape_features.csv")
-
-    # # 2) Merge on subject & image
-    # df = pd.merge(latents, vols,
-    #             on=["subject_id","image_uid"],
-    #             how="inner")
-
-    # # 3) Pick one volume metric and define extremes
-    # vol_col = "left_cerebral_white_matter__volume_mm3"
-    # low, high = np.percentile(df[vol_col], [5,95])
-    # df["is_vol_extreme"] = (
-    #     (df[vol_col] <= low)
-    #     | (df[vol_col] >= high)
-    # )
-
-    # # 4) Build a confusion table
-    # ct = pd.crosstab(df["is_latent_extreme"], df["is_vol_extreme"],
-    #                 rownames=["latent extreme"], colnames=["volume extreme"])
-    # print(ct)
-
-    # # 5) Quantify overlap
-    # n_both   = ct.loc[True, True]
-    # n_latent = df["is_latent_extreme"].sum()
-    # print(f"{n_both} of {n_latent} latent‐extreme samples are also volume‐extreme")
-
-    # # 6) Visualize
-
-    # # assume df, dist, and high are already defined:
-    # v95 = np.percentile(df["dist"], 95)
-    # h95 = high  # your 95th‐percentile volume
-
-    # fig, ax = plt.subplots(figsize=(6,4))
-
-    # # scatter
-    # ax.scatter(df["dist"], df[vol_col],
-    #         c=df["is_latent_extreme"].map({False:"gray", True:"red"}),
-    #         alpha=0.6)
-
-    # # 95th‐percentile lines
-    # ax.axvline(v95, linestyle="--", color="red")
-    # ax.axhline(h95, linestyle="--", color="blue")
-
-    # # annotate the lines
-    # # for the vertical line, place text at the top of the plot
-    # ax.text(v95, ax.get_ylim()[1],
-    #         f"{v95:.1f}", color="red",
-    #         ha="right", va="bottom")
-
-    # # for the horizontal line, place text at the left of the plot
-    # ax.text(ax.get_xlim()[0], h95,
-    #         f"{h95:.0f}", color="blue",
-    #         ha="left", va="bottom")
-
-    # # labels and title
-    # ax.set_xlabel("Latent‐space distance")
-    # ax.set_ylabel(vol_col)             # ensure this label is fully visible
-    # ax.set_title("Latent distance vs. volume")
-
-    # # ensure no clipping of labels
-    # fig.tight_layout()
-    # plt.savefig("cerebral_WM_volume_extremes_scatter.png")
+    # latents = pd.read_csv(home/andim/projects/def-bedelb/andim/brlp-data/healthy_shape_features.csv")
+    # plot_extremes_latent_vols_one_region('left_cerebral_white_matter__volume_mm3')
+    # plot_extremes_latent_volumes_with_age(latents, vols)
+    # plot_extremes_latent_volumes(latents, vols)
     
-
-
-
-
-
+    ## === MIXED EFFECTS MODEL ON LATENT DISTANCES AND AGE ===
+    # LME_model_latent_age("latents_extremes.csv")
+    

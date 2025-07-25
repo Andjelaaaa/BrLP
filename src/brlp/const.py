@@ -63,11 +63,11 @@ CONDITIONING_VARIABLES = [
     "age", 
     "sex",
     # "diagnosis",
-    "cerebral_cortex", 
-    "hippocampus", 
-    "amygdala",
-    "cerebral_white_matter",
-    "lateral_ventricle", 
+    # "cerebral_cortex", 
+    # "hippocampus", 
+    # "amygdala",
+    # "cerebral_white_matter",
+    # "lateral_ventricle", 
 ]
 
 # CONDITIONING_REGIONS = [
@@ -126,19 +126,19 @@ LATENT_SHAPE_DM = (3, 16, 20, 16)
 # ])
 
 # Affine matrix for ANTS 0-8 resampled to 1.3mm^3
-# MNI152_1P5MM_AFFINE = np.array([         
-#     [ -1.3, 0,    0,    65   ],
-#     [ 0,    1.3,  0,    -105 ],
-#     [ 0,    0,    1.3,  -56  ],
-#     [ 0,    0,     0,   1    ]
-# ])
-# Affine matrix for ANTS 0-8 resampled to 1.3mm^3
 MNI152_1P5MM_AFFINE = np.array([         
-    [ -1.3, 0,    0,    -98   ],
-    [ 0,    1.3,  0,    -134 ],
-    [ 0,    0,    1.3,  -72  ],
+    [ -1.3, 0,    0,    65   ],
+    [ 0,    1.3,  0,    -105 ],
+    [ 0,    0,    1.3,  -56  ],
     [ 0,    0,     0,   1    ]
 ])
+# Affine matrix for MNI 4.5-8.5 resampled to 1.3mm^3
+# MNI152_1P5MM_AFFINE = np.array([         
+#     [ -1.3, 0,    0,    -98   ],
+#     [ 0,    1.3,  0,    -134 ],
+#     [ 0,    0,    1.3,  -72  ],
+#     [ 0,    0,     0,   1    ]
+# ])
 
 # AGE_MIN, AGE_MAX, AGE_DELTA = 0, 100, 100
 AGE_MIN, AGE_MAX, AGE_DELTA = 1, 7, 6

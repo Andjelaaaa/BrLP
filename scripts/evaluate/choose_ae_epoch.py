@@ -100,8 +100,8 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # === CONFIG ===
 csv_path     = "/home/andim/projects/def-bedelb/andim/brlp-data/A.csv"
-cache_dir    = "/home/andim/scratch/brlp/ae_cache"
-ckpt_dir     = "/home/andim/scratch/brlp/ae_output"
+cache_dir    = "/home/andim/scratch/brlp/ae_cache_long"
+ckpt_dir     = "/home/andim/scratch/brlp/ae_output_long"
 batch_size   = 2
 num_workers  = 4
 seeds        = [0, 1, 2, 3, 4]  # seeds to evaluate
@@ -169,7 +169,7 @@ for seed in seeds:
         print(f'{fname}: {val_loss:.6f}')
 
 # === SAVE ALL RESULTS TO CSV ===
-csv_output_path = os.path.join(ckpt_dir, "validation_losses_over_seeds.csv")
+csv_output_path = os.path.join("validation_losses_over_seeds_output_long.csv")
 with open(csv_output_path, mode="w", newline="") as f:
     writer = csv.writer(f)
     writer.writerow(["seed", "checkpoint", "val_loss"])
