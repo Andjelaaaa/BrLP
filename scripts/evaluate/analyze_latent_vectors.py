@@ -1083,7 +1083,7 @@ if __name__ == '__main__':
 
     ## === COMPARE RELATIONSHIP BETWEEN LATENT DISTANCES AND VOLUME MEASURES ===
     # --- 1) Load and merge data ---
-    # latents = pd.read_csv(home/andim/projects/def-bedelb/andim/brlp-data/healthy_shape_features.csv")
+    # vols = pd.read_csv(home/andim/projects/def-bedelb/andim/brlp-data/healthy_shape_features.csv")
     # plot_extremes_latent_vols_one_region('left_cerebral_white_matter__volume_mm3')
     # plot_extremes_latent_volumes_with_age(latents, vols)
     # plot_extremes_latent_volumes(latents, vols)

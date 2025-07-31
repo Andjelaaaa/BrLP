@@ -449,6 +449,21 @@ def compute_relative_volumes(seg: np.ndarray, voxel_volume: float = RESOLUTION**
         relative_vols[f"relvol_{name}"] = rel_vol
     return relative_vols
 
+def compute_absolute_volumes(seg: np.ndarray, voxel_volume: float = RESOLUTION**3):
+    """
+    Compute absolute volume (mm³) for each region in the segmentation.
+    Excludes background (label 0).
+    Returns a dict: {label_name: volume_in_mm3}
+    """
+    label_counts = {lbl: (seg == lbl).sum() for lbl in np.unique(seg) if lbl != 0}
+    abs_vols = {
+        f"absvol_{SYNTHSEG_CODEMAP.get(lbl, f'label_{lbl}')}": count * voxel_volume
+        for lbl, count in label_counts.items()
+    }
+    return abs_vols
+
+def compute_total_brain_volume(seg: np.ndarray, voxel_volume: float = RESOLUTION**3):
+    return (seg != 0).sum() * voxel_volume
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -522,18 +537,18 @@ if __name__ == "__main__":
         true_seg = row.followup_segm_path
 
         # -- also preprocess & save the T2 *ground-truth* segmentation
-        seg_arr = seg_pipe({'seg': row.followup_segm_path})['seg']
-        # cast to int32
-        seg_arr = seg_arr.astype(np.int32)
-        nib.save(nib.Nifti1Image(seg_arr[0], MNI152_1P5MM_AFFINE),
-                 os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2segtform.nii.gz"))
+        # seg_arr = seg_pipe({'seg': row.followup_segm_path})['seg']
+        # # cast to int32
+        # seg_arr = seg_arr.astype(np.int32)
+        # nib.save(nib.Nifti1Image(seg_arr[0], MNI152_1P5MM_AFFINE),
+        #          os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2segtform.nii.gz"))
 
-        # # # -- also preprocess & save the T2 *predicted* segmentation
-        seg_arr = seg_pipe({'seg': pred_seg})['seg']
-        # cast to int32
-        seg_arr = seg_arr.astype(np.int32)
-        nib.save(nib.Nifti1Image(seg_arr[0], MNI152_1P5MM_AFFINE),
-                 os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2pred_segtform.nii.gz"))
+        # # # # -- also preprocess & save the T2 *predicted* segmentation
+        # seg_arr = seg_pipe({'seg': pred_seg})['seg']
+        # # cast to int32
+        # seg_arr = seg_arr.astype(np.int32)
+        # nib.save(nib.Nifti1Image(seg_arr[0], MNI152_1P5MM_AFFINE),
+        #          os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2pred_segtform.nii.gz"))
 
         pred_seg = os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2pred_segtform.nii.gz")
         true_seg = os.path.join(args.pred_dir, f"{sid}_{T1}_{T2}_T2segtform.nii.gz")
@@ -579,46 +594,57 @@ if __name__ == "__main__":
             col  = f"dice_{name}"
             rec[col] = score
             # log each to wandb under a sensible key
-            wandb.log({f"test/dice/{name}": score}, step=idx)
+            # wandb.log({f"test/dice/{name}": score}, step=idx)
 
         for k, v in relvol_true.items():
             rec[k + "_gt"] = v
         for k, v in relvol_pred.items():
             rec[k + "_pred"] = v
 
+        absvol_pred = compute_absolute_volumes(p)
+        absvol_true = compute_absolute_volumes(t)
+
+        for k, v in absvol_pred.items():
+            rec[k + "_pred"] = v
+        for k, v in absvol_true.items():
+            rec[k + "_gt"] = v
+
+        rec["total_volume_pred"] = compute_total_brain_volume(p)
+        rec["total_volume_gt"]   = compute_total_brain_volume(t)
+
         results.append(rec)
 
         # log full-volume side-by-side GIF
-        log_full_volume_segmentation_gif_with_view(
-            true_mask_np=t,
-            pred_mask_np=p,
-            palette=palette,
-            output_dir=".",
-            view="axial",        
-            tag="My/Slices_Axial",
-            duration=200
-        )
-        log_full_volume_segmentation_gif_with_view(
-            true_mask_np=t,
-            pred_mask_np=p,
-            palette=palette,
-            output_dir=".",
-            view="coronal",        
-            tag="My/Slices_Coronal",
-            duration=200
-        )
-        log_full_volume_segmentation_gif_with_view(
-            true_mask_np=t,
-            pred_mask_np=p,
-            palette=palette,
-            output_dir=".",
-            view="sagittal",        
-            tag="My/Slices_Sagittal",
-            duration=200
-        )
+        # log_full_volume_segmentation_gif_with_view(
+        #     true_mask_np=t,
+        #     pred_mask_np=p,
+        #     palette=palette,
+        #     output_dir=".",
+        #     view="axial",        
+        #     tag="My/Slices_Axial",
+        #     duration=200
+        # )
+        # log_full_volume_segmentation_gif_with_view(
+        #     true_mask_np=t,
+        #     pred_mask_np=p,
+        #     palette=palette,
+        #     output_dir=".",
+        #     view="coronal",        
+        #     tag="My/Slices_Coronal",
+        #     duration=200
+        # )
+        # log_full_volume_segmentation_gif_with_view(
+        #     true_mask_np=t,
+        #     pred_mask_np=p,
+        #     palette=palette,
+        #     output_dir=".",
+        #     view="sagittal",        
+        #     tag="My/Slices_Sagittal",
+        #     duration=200
+        # )
 
     # finally write out your CSV
-    summary_csv = os.path.join(args.out_dir, "test_dice_scores.csv")
+    summary_csv = os.path.join(args.out_dir, "test_dice_scores_vols_all.csv")
     pd.DataFrame(results).to_csv(summary_csv, index=False)
     wandb.save(summary_csv)
     wandb.finish()

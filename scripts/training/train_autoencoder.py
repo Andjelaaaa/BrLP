@@ -1,11 +1,13 @@
 import os
 import argparse
 import warnings
-
+import wandb
 import pandas as pd
+import matplotlib.pyplot as plt
 import torch
 from tqdm import tqdm
 from monai import transforms
+from datetime import datetime
 from monai.utils import set_determinism
 
 from torch.nn import L1Loss
@@ -26,6 +28,46 @@ from brlp import (
 set_determinism(0)
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+def wb_log_reconstruction(step: int, image: torch.Tensor, recon: torch.Tensor):
+    """
+    Log a 2×3 grid of orthogonal slices (original vs reconstruction)
+    to Weights & Biases at the given step.
+    """
+    # Convert 4D (1×C×D×H×W) → 3D (D×H×W) if needed
+    if image.ndim == 5:  # e.g. [1,1,D,H,W]
+        image = image.squeeze(0).squeeze(0)
+    if recon.ndim == 5:
+        recon = recon.squeeze(0).squeeze(0)
+
+    # Compute center indices
+    d, h, w = image.shape
+    md, mh, mw = d // 2, h // 2, w // 2
+
+    # Build the figure
+    fig, axes = plt.subplots(2, 3, figsize=(7, 5))
+    for ax in axes.flatten():
+        ax.axis('off')
+
+    # Row 0: original slices
+    axes[0, 0].set_title('original (axial)',    color='cyan')
+    axes[0, 0].imshow(image[md, :, :], cmap='gray')
+    axes[0, 1].imshow(image[:, mh, :], cmap='gray')
+    axes[0, 2].imshow(image[:, :, mw], cmap='gray')
+
+    # Row 1: reconstructed slices
+    axes[1, 0].set_title('recon (axial)',       color='magenta')
+    axes[1, 0].imshow(recon[md, :, :], cmap='gray')
+    axes[1, 1].imshow(recon[:, mh, :], cmap='gray')
+    axes[1, 2].imshow(recon[:, :, mw], cmap='gray')
+
+    plt.tight_layout()
+
+    # Log to W&B
+    wandb.log({"Reconstruction": wandb.Image(fig)}, step=step)
+
+    # Clean up
+    plt.close(fig)
+
 
 if __name__ == '__main__':
 
@@ -41,8 +83,19 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size',     default=16,    type=int)
     parser.add_argument('--lr',             default=1e-4,  type=float)
     parser.add_argument('--aug_p',          default=0.8,   type=float)
+    parser.add_argument('--fold_test',      required=True,  type=int,
+                        help="Which fold (0–4) to hold out as test")
     args = parser.parse_args()
 
+    run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+
+    wandb.init(
+    project="ae-training",
+    config=vars(args),      # logs all CLI args as hyperparameters
+    mode="offline",         # records locally; you can later `wandb sync`
+    name=f"{run_name}_foldtest{args.fold_test}",
+    dir=args.output_dir     # where to write the wandb files
+    )
 
     transforms_fn = transforms.Compose([
         transforms.CopyItemsD(keys={'image_path'}, names=['image']),
@@ -53,8 +106,17 @@ if __name__ == '__main__':
         transforms.ScaleIntensityD(minv=0, maxv=1, keys=['image'])
     ])
 
+    # pick your test‐fold from the CLI
+    fold = args.fold_test
+    if fold not in range(5):
+        raise ValueError(f"fold_test must be 0..4, got {fold}")
+
+    print(f"\n\n=== Training on folds {set(range(5)) - {fold}}; testing on fold {fold} ===")
+
     dataset_df = pd.read_csv(args.dataset_csv)
-    train_df = dataset_df[ dataset_df.split == 'train' ]
+    # train_df = dataset_df[ dataset_df.split == 'train' ]
+    # split by your fold column
+    train_df = dataset_df[ dataset_df['split'] != fold ].reset_index(drop=True)
     trainset = get_dataset_from_pd(train_df, transforms_fn, args.cache_dir)
 
     train_loader = DataLoader(dataset=trainset, 
@@ -99,7 +161,7 @@ if __name__ == '__main__':
                                      grad_scaler=GradScaler())
 
     avgloss = utils.AverageLoss()
-    writer = SummaryWriter()
+    # writer = SummaryWriter()
     total_counter = 0
 
 
@@ -158,12 +220,21 @@ if __name__ == '__main__':
 
             
             if total_counter % 10 == 0:
+                # log scalar losses
                 step = total_counter // 10
-                avgloss.to_tensorboard(writer, step)
-                utils.tb_display_reconstruction(writer, step, images[0].detach().cpu(), reconstruction[0].detach().cpu())
+                scalars = avgloss.to_dict()  # e.g. {'Generator/reconstruction_loss': ..., ...}
+                wandb.log(scalars, step=step)
+                wb_log_reconstruction(step=step, image=images[0].detach().cpu(), recon=reconstruction[0].detach().cpu())
+                # step = total_counter // 10
+                # avgloss.to_tensorboard(writer, step)
+                # utils.tb_display_reconstruction(writer, step, images[0].detach().cpu(), reconstruction[0].detach().cpu())
         
             total_counter += 1
 
         # Save the model after each epoch.
         torch.save(discriminator.state_dict(), os.path.join(args.output_dir, f'discriminator-ep-{epoch}.pth'))
         torch.save(autoencoder.state_dict(),   os.path.join(args.output_dir, f'autoencoder-ep-{epoch}.pth'))
+        # torch.save(discriminator.state_dict(),
+        #            os.path.join(args.output_dir, f'disc_foldtest_{fold}_ep{epoch}.pth'))
+        # torch.save(autoencoder.state_dict(),
+        #            os.path.join(args.output_dir, f'ae_foldtest_{fold}_ep{epoch}.pth'))
