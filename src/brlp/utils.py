@@ -71,6 +71,13 @@ class AverageLoss:
         if not losses:
             return 0.0
         return sum(losses) / len(losses)
+        
+    def to_dict(self) -> dict[str, float]:
+        """
+        Return a dict of current average values WITHOUT clearing.
+        Example: {'Generator/reconstruction_loss': 0.123, ...}
+        """
+        return {k: self.get_avg(k) for k in self.losses_accumulator if self.losses_accumulator.get(k)}
     
     def to_tensorboard(self, writer: SummaryWriter, step: int):
         """
@@ -83,6 +90,16 @@ class AverageLoss:
         """
         for metric_key in list(self.losses_accumulator.keys()):
             writer.add_scalar(metric_key, self.pop_avg(metric_key), step)
+
+    def to_wandb(self, wandb, step: int):
+        """
+        Logs the average value of all the metrics stored into wandb, then clears them.
+        """
+        scalars = {}
+        for metric_key in list(self.losses_accumulator.keys()):
+            scalars[metric_key] = self.pop_avg(metric_key)
+        # wandb.log accepts the step keyword
+        wandb.log(scalars, step=step)
             
             
 def to_vae_latent_trick(z: torch.Tensor, unpadded_z_shape: tuple = (3, 15, 18, 15)) -> torch.Tensor:

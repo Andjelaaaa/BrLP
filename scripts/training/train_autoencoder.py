@@ -28,44 +28,68 @@ from brlp import (
 set_determinism(0)
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+def _to_volume(x: torch.Tensor) -> torch.Tensor:
+    """
+    Reduce tensor to a 3D volume (D,H,W) by removing
+    batch/channel dims when they are singleton; if multiple
+    channels exist, take the first.
+    """
+    x = x.detach().cpu()
+    # if shape is like [B, C, D, H, W], drop batch if 1, then handle channel
+    if x.ndim == 5:
+        if x.shape[0] == 1:
+            x = x.squeeze(0)  # now [C, D, H, W]
+        # if still 4D, handle channel
+        if x.ndim == 4:
+            if x.shape[0] == 1:
+                x = x.squeeze(0)  # [D, H, W]
+            else:
+                # multiple channels: pick first
+                x = x[0]
+    elif x.ndim == 4:
+        # could be [1, D, H, W] or [C, D, H, W]
+        if x.shape[0] == 1:
+            x = x.squeeze(0)
+        else:
+            x = x[0]
+    elif x.ndim != 3:
+        raise ValueError(f"Cannot convert tensor with shape {x.shape} to 3D volume.")
+    return x  # guaranteed (D,H,W)
+
 def wb_log_reconstruction(step: int, image: torch.Tensor, recon: torch.Tensor):
     """
     Log a 2×3 grid of orthogonal slices (original vs reconstruction)
     to Weights & Biases at the given step.
     """
-    # Convert 4D (1×C×D×H×W) → 3D (D×H×W) if needed
-    if image.ndim == 5:  # e.g. [1,1,D,H,W]
-        image = image.squeeze(0).squeeze(0)
-    if recon.ndim == 5:
-        recon = recon.squeeze(0).squeeze(0)
+    img_vol = _to_volume(image)
+    recon_vol = _to_volume(recon)
 
     # Compute center indices
-    d, h, w = image.shape
+    d, h, w = img_vol.shape
     md, mh, mw = d // 2, h // 2, w // 2
 
     # Build the figure
     fig, axes = plt.subplots(2, 3, figsize=(7, 5))
     for ax in axes.flatten():
-        ax.axis('off')
+        ax.axis("off")
 
     # Row 0: original slices
-    axes[0, 0].set_title('original (axial)',    color='cyan')
-    axes[0, 0].imshow(image[md, :, :], cmap='gray')
-    axes[0, 1].imshow(image[:, mh, :], cmap='gray')
-    axes[0, 2].imshow(image[:, :, mw], cmap='gray')
+    axes[0, 0].set_title("original (axial)", color="cyan")
+    axes[0, 0].imshow(img_vol[md, :, :], cmap="gray", origin="lower")
+    axes[0, 1].imshow(img_vol[:, mh, :], cmap="gray", origin="lower")
+    axes[0, 2].imshow(img_vol[:, :, mw], cmap="gray", origin="lower")
 
     # Row 1: reconstructed slices
-    axes[1, 0].set_title('recon (axial)',       color='magenta')
-    axes[1, 0].imshow(recon[md, :, :], cmap='gray')
-    axes[1, 1].imshow(recon[:, mh, :], cmap='gray')
-    axes[1, 2].imshow(recon[:, :, mw], cmap='gray')
+    axes[1, 0].set_title("recon (axial)", color="magenta")
+    axes[1, 0].imshow(recon_vol[md, :, :], cmap="gray", origin="lower")
+    axes[1, 1].imshow(recon_vol[:, mh, :], cmap="gray", origin="lower")
+    axes[1, 2].imshow(recon_vol[:, :, mw], cmap="gray", origin="lower")
 
     plt.tight_layout()
 
     # Log to W&B
     wandb.log({"Reconstruction": wandb.Image(fig)}, step=step)
 
-    # Clean up
     plt.close(fig)
 
 
@@ -218,17 +242,14 @@ if __name__ == '__main__':
             avgloss.put('Generator/kl_regularization',      kld_loss.item())
             avgloss.put('Discriminator/adverarial_loss',    loss_d.item())
 
-            
             if total_counter % 10 == 0:
-                # log scalar losses
                 step = total_counter // 10
-                scalars = avgloss.to_dict()  # e.g. {'Generator/reconstruction_loss': ..., ...}
-                wandb.log(scalars, step=step)
+                # log to wandb and clear
+                avgloss.to_wandb(wandb, step=step)
                 wb_log_reconstruction(step=step, image=images[0].detach().cpu(), recon=reconstruction[0].detach().cpu())
-                # step = total_counter // 10
-                # avgloss.to_tensorboard(writer, step)
+                # optional tensorboard:
                 # utils.tb_display_reconstruction(writer, step, images[0].detach().cpu(), reconstruction[0].detach().cpu())
-        
+            
             total_counter += 1
 
         # Save the model after each epoch.
