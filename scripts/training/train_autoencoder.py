@@ -108,7 +108,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr',             default=1e-4,  type=float)
     parser.add_argument('--aug_p',          default=0.8,   type=float)
     parser.add_argument('--fold_test',      required=True,  type=int,
-                        help="Which fold (0–4) to hold out as test")
+                        help="Which fold (1-5) to hold out as test")
     args = parser.parse_args()
 
     run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
@@ -132,10 +132,10 @@ if __name__ == '__main__':
 
     # pick your test‐fold from the CLI
     fold = args.fold_test
-    if fold not in range(5):
-        raise ValueError(f"fold_test must be 0..4, got {fold}")
+    if fold not in range(1,6):
+        raise ValueError(f"fold_test must be 1..5, got {fold}")
 
-    print(f"\n\n=== Training on folds {set(range(5)) - {fold}}; testing on fold {fold} ===")
+    print(f"\n\n=== Training on folds {set(range(1,6)) - {fold}}; testing on fold {fold} ===")
 
     dataset_df = pd.read_csv(args.dataset_csv)
     # train_df = dataset_df[ dataset_df.split == 'train' ]

@@ -417,6 +417,8 @@ if __name__ == '__main__':
                         help="W&B project name")
     parser.add_argument('--run_name',       default=None,   type=str,
                         help="W&B run name (if omitted, it puts the date and time the experiment was run)")
+    parser.add_argument('--fold_test',      required=True,  type=int,
+                        help="Which fold (0–4) to hold out as test")
     args = parser.parse_args()
 
     set_determinism(0)
@@ -442,15 +444,23 @@ if __name__ == '__main__':
             "batch_size": args.batch_size,
             "lr": args.lr,
             "resolution": const.RESOLUTION,
-            "input_shape": const.INPUT_SHAPE_AE
+            "input_shape": const.INPUT_SHAPE_AE,
+            "fold_test": args.fold_test
         }
     )
     config = wandb.config
 
     # ─── Build train/val splits ────────────────────────────────────
     dataset_df = pd.read_csv(config.dataset_csv)
-    train_df = dataset_df[dataset_df.split == 'train'].copy().reset_index(drop=True)
-    val_df   = dataset_df[dataset_df.split == 'val'].copy().reset_index(drop=True)
+    fold = args.fold_test
+    if not 0 <= fold < 5:
+        raise ValueError(f"--fold_test must be between 0 and 4, got {fold}")
+
+    # assume `split` column holds integer fold labels 0–4
+    test_df  = dataset_df[dataset_df.split == fold].reset_index(drop=True)
+    train_df = dataset_df[dataset_df.split != fold].reset_index(drop=True)
+
+    print(f"Training on folds {set(range(5)) - {fold}}; testing on fold {fold}")
 
     # ─── Datasets & DataLoaders ────────────────────────────────────
     train_ds = LongitudinalMRIDataset(
@@ -465,22 +475,6 @@ if __name__ == '__main__':
         num_workers=args.num_workers,
         pin_memory=True
     )
-
-    if len(val_df) > 0:
-        val_ds = LongitudinalMRIDataset(
-            df=val_df,
-            resolution=config.resolution,
-            target_shape=config.input_shape
-        )
-        val_loader = DataLoader(
-            dataset=val_ds,
-            batch_size=config.max_batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=True
-        )
-    else:
-        val_loader = None
 
     # ─── Load pretrained AutoencoderKL and Discriminator ────────────
     autoencoder = init_autoencoder(config.aekl_ckpt).to(DEVICE)
@@ -766,28 +760,8 @@ if __name__ == '__main__':
             os.path.join(args.output_dir, f'discriminator_epoch{epoch}.pth')
         )
 
-        # ── Validation Pass (optional) ─────────────────────────
-        if val_loader is not None:
-            model.eval()
-            val_loss = 0.0
-            count = 0
-            with torch.no_grad():
-                for batch in val_loader:
-                    img0, age0, img1, age1 = batch
-                    img0 = img0.to(DEVICE)
-                    img1 = img1.to(DEVICE)
-                    age1 = age1.to(DEVICE)
-
-                    x1_pred = model(img0, age1)
-                    rec = l1_loss_fn(x1_pred, img1)
-                    val_loss += rec.item() * img0.size(0)
-                    count += img0.size(0)
-
-                avg_val = val_loss / count
-                print(f"Epoch {epoch} ▶︎ Validation L1 = {avg_val:.4f}")
-                wandb.log({'val/rec_loss': avg_val, 'epoch': epoch})
-        else:
-            print(f"Epoch {epoch} ▶︎ Train L1 = {avgloss.get_avg('Generator/rec_loss'):.4f}")
+        
+        print(f"Epoch {epoch} ▶︎ Train L1 = {avgloss.get_avg('Generator/rec_loss'):.4f}")
 
     # read back all frames in order
     frames = [Image.open(f) for f in diff_frames]
