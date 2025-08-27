@@ -180,7 +180,11 @@ if __name__ == '__main__':
     # csv_B = make_csv_B(csv_A)
     # csv_B.to_csv(os.path.join(args.output_path, 'B.csv'), index=False)
 
-    print()
-    print('> Creating CSV C\n')
-    csv_C = make_csv_trios(df) # reading csv A
-    csv_C.to_csv(os.path.join(args.output_path, 'C_nonnormed_vol.csv'), index=False)
+    # print()
+    # print('> Creating CSV C\n')
+    # csv_C = make_csv_trios(df) # reading csv A
+    # csv_C.to_csv(os.path.join(args.output_path, 'C_nonnormed_vol.csv'), index=False)
+
+    print('> Creating CSV B\n')
+    csv_B = make_csv_B(df)
+    csv_B.to_csv(os.path.join(args.output_path, 'B_combined-dataset.csv'), index=False)

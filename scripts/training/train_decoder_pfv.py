@@ -107,7 +107,7 @@ def log_recon_3x4_to_wandb(
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
     # save, log, remove
-    tmp = f"tmp_{sid}_{uid}_3x4.png"
+    tmp = f"{args.output_dir}/tmp_{sid}_{uid}_3x4.png"
     plt.savefig(tmp, dpi=120)
     plt.close(fig)
     if step is not None:
@@ -388,8 +388,10 @@ class LongitudinalMRIDataset(Dataset):
         img1 = followup_t.float()  # [1, D, H, W]
 
         # 2) Normalize ages [1..7] → [0..1]
-        age0 = (row['starting_age'] * 6 - 1.0) / 6.0
-        age1 = (row['followup_age'] * 6  - 1.0) / 6.0
+        # age0 = (row['starting_age'] * 6 - 1.0) / 6.0
+        # age1 = (row['followup_age'] * 6  - 1.0) / 6.0
+        age0 = (row['starting_age']) 
+        age1 = (row['followup_age'])
         age0 = torch.tensor([age0], dtype=torch.float32)
         age1 = torch.tensor([age1], dtype=torch.float32)
 
@@ -453,10 +455,12 @@ if __name__ == '__main__':
     # ─── Build train/val splits ────────────────────────────────────
     dataset_df = pd.read_csv(config.dataset_csv)
     fold = args.fold_test
-    if not 0 <= fold < 5:
-        raise ValueError(f"--fold_test must be between 0 and 4, got {fold}")
+    if fold not in range(1,6):
+        raise ValueError(f"fold_test must be 1..5, got {fold}")
 
-    # assume `split` column holds integer fold labels 0–4
+    print(f"\n\n=== Training on folds {set(range(1,6)) - {fold}}; testing on fold {fold} ===")
+
+    # assume `split` column holds integer fold labels 1-5
     test_df  = dataset_df[dataset_df.split == fold].reset_index(drop=True)
     train_df = dataset_df[dataset_df.split != fold].reset_index(drop=True)
 
@@ -642,8 +646,10 @@ if __name__ == '__main__':
                 recon_vol = recon0[0, 0].detach().cpu().numpy()[None, ...]  # [1,D,H,W]
 
                 # 4) Convert normalized ages back to years (if needed)
-                age0_years = age0[0].item() * 6.0 + 1.0
-                age1_years = age1[0].item() * 6.0 + 1.0
+                # age0_years = age0[0].item() * 6.0 + 1.0
+                # age1_years = age1[0].item() * 6.0 + 1.0
+                age0_years = age0[0].item() * (84.0-12.0) + 12.0
+                age1_years = age1[0].item() * (84.0-12.0) + 12.0
 
                 # 5) Build meta dict including subject_id and image_uid
                 meta = {
@@ -696,7 +702,7 @@ if __name__ == '__main__':
                 # plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
                 # save + log
-                tmpd = f"abs_errors_e{epoch}_it{it}.png"
+                tmpd = f"{args.output_dir}/abs_errors_e{epoch}_it{it}.png"
                 fig.savefig(tmpd, dpi=100)
                 plt.close(fig)
 
