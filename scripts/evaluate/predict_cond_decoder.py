@@ -19,8 +19,32 @@ if __name__=="__main__":
     p.add_argument("--dec_ckpt",   required=True)
     p.add_argument("--aekl_ckpt",  required=True)
     p.add_argument("--out_dir",    required=True)
+    p.add_argument("--fold",       type=int, default=None,
+                   help="If set, test set = rows where split == fold.")
+    p.add_argument("--split_col", type=str, default="split",
+                        help="Column with fold ids (default: 'split').")
     args = p.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
+
+    # 1) read CSV and pick test rows
+    df = pd.read_csv(args.csv)
+
+    if args.fold is not None:
+        if "split" not in df.columns:
+            raise KeyError(f"'split' column not found in {args.csv}")
+        test = df[df["split"] == args.fold].reset_index(drop=True)
+        sel_desc = f"split == {args.fold}"
+    else:
+        # fallback to legacy behavior if no fold provided
+        if "split" not in df.columns:
+            raise RuntimeError("No --fold provided and no 'split' column present.")
+        test = df[df["split"] == "test"].reset_index(drop=True)
+        sel_desc = "split == 'test'"
+
+    if test.empty:
+        raise RuntimeError(f"No rows matched selection: {sel_desc}")
+
+    print(f"[predict] Using {len(test)} samples ({sel_desc}).")
 
     # 1) rebuild models
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -54,9 +78,7 @@ if __name__=="__main__":
                                 mode='minimum',
                                 keys=['seg']),
     ])
-
-    df = pd.read_csv(args.csv)
-    test = df[df.split=='test']
+    print('Starting predicting...')
     for _, row in test.iterrows():
         sid = row.subject_id
         T1 = row.starting_image_uid
@@ -64,7 +86,7 @@ if __name__=="__main__":
         # -- predict T2 from T1 image + age
         arr = img_pipe({'img': row.starting_image_path})['img']  # [C,D,H,W]
         x0 = arr.unsqueeze(0).to(device)
-        age = torch.tensor([[(row.followup_age-1)/6.]],device=device)
+        age = torch.tensor([[(row.followup_age)]],device=device)
         with torch.no_grad():
             pred = model(x0, age)[0,0].cpu().numpy()
         nib.save(nib.Nifti1Image(pred, const.MNI152_1P5MM_AFFINE),

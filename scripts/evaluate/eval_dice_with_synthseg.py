@@ -5,6 +5,7 @@ import pandas as pd
 import nibabel as nib
 import numpy as np
 import wandb
+import re
 from monai.metrics import DiceMetric
 from matplotlib import pyplot as plt
 import subprocess
@@ -162,88 +163,88 @@ def log_full_volume_segmentation_gif(
     # Cleanup
     os.remove(gif_path)
 
-def log_full_volume_segmentation_gif_with_view(
-    true_mask_np: np.ndarray,
-    pred_mask_np: np.ndarray,
-    palette: dict,
-    output_dir: str,
-    view: str = "sagittal",           # now you can pick "axial"|"coronal"|"sagittal"
-    tag: str = "test/segmentation_comparison",
-    step: Optional[int] = None,
-    duration: int = 100
-):
-    """
-    Turn every slice in one orientation into a side-by-side TRUE vs PRED GIF,
-    coloring by your `palette`.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    D, H, W = true_mask_np.shape
+# def log_full_volume_segmentation_gif_with_view(
+#     true_mask_np: np.ndarray,
+#     pred_mask_np: np.ndarray,
+#     palette: dict,
+#     output_dir: str,
+#     view: str = "sagittal",           # now you can pick "axial"|"coronal"|"sagittal"
+#     tag: str = "test/segmentation_comparison",
+#     step: Optional[int] = None,
+#     duration: int = 100
+# ):
+#     """
+#     Turn every slice in one orientation into a side-by-side TRUE vs PRED GIF,
+#     coloring by your `palette`.
+#     """
+#     os.makedirs(output_dir, exist_ok=True)
+#     D, H, W = true_mask_np.shape
 
-    # 1) build label→RGB lookup from the palette
-    label2rgb = {}
-    for lbl, name in SYNTHSEG_CODEMAP.items():
-        rgbf = palette.get(name, (0.8,0.8,0.8))  # fallback grey if missing
-        label2rgb[lbl] = tuple((np.array(rgbf)*255).astype(np.uint8))
+#     # 1) build label→RGB lookup from the palette
+#     label2rgb = {}
+#     for lbl, name in SYNTHSEG_CODEMAP.items():
+#         rgbf = palette.get(name, (0.8,0.8,0.8))  # fallback grey if missing
+#         label2rgb[lbl] = tuple((np.array(rgbf)*255).astype(np.uint8))
 
-    # 2) pick the slicing function
-    if view.lower() == "axial":
-        slicer = lambda vol, i: vol[i, :, :]
-        n_slices = D
-    elif view.lower() == "coronal":
-        slicer = lambda vol, i: vol[:, i, :]
-        n_slices = H
-    elif view.lower() == "sagittal":
-        slicer = lambda vol, i: vol[:, :, i]
-        n_slices = W
-    else:
-        raise ValueError("view must be one of axial/coronal/sagittal")
+#     # 2) pick the slicing function
+#     if view.lower() == "axial":
+#         slicer = lambda vol, i: vol[i, :, :]
+#         n_slices = D
+#     elif view.lower() == "coronal":
+#         slicer = lambda vol, i: vol[:, i, :]
+#         n_slices = H
+#     elif view.lower() == "sagittal":
+#         slicer = lambda vol, i: vol[:, :, i]
+#         n_slices = W
+#     else:
+#         raise ValueError("view must be one of axial/coronal/sagittal")
 
-    frames = []
-    for i in range(n_slices):
-        t_sl = slicer(true_mask_np, i)
-        p_sl = slicer(pred_mask_np, i)
+#     frames = []
+#     for i in range(n_slices):
+#         t_sl = slicer(true_mask_np, i)
+#         p_sl = slicer(pred_mask_np, i)
 
-        # 3) colorize each 2D label‐map to an RGB image
-        def colorize(lbl_slice: np.ndarray):
-            h, w = lbl_slice.shape
-            rgb = np.zeros((h, w, 3), dtype=np.uint8)
-            for lbl, col in label2rgb.items():
-                rgb[lbl_slice == lbl] = col
-            return rgb
+#         # 3) colorize each 2D label‐map to an RGB image
+#         def colorize(lbl_slice: np.ndarray):
+#             h, w = lbl_slice.shape
+#             rgb = np.zeros((h, w, 3), dtype=np.uint8)
+#             for lbl, col in label2rgb.items():
+#                 rgb[lbl_slice == lbl] = col
+#             return rgb
 
-        im_t = Image.fromarray(colorize(t_sl))
-        draw = ImageDraw.Draw(im_t)
-        draw.text((5,5), "TRUE", fill="white", stroke_width=1, stroke_fill="black")
+#         im_t = Image.fromarray(colorize(t_sl))
+#         draw = ImageDraw.Draw(im_t)
+#         draw.text((5,5), "TRUE", fill="white", stroke_width=1, stroke_fill="black")
 
-        im_p = Image.fromarray(colorize(p_sl))
-        draw = ImageDraw.Draw(im_p)
-        draw.text((5,5), "PRED", fill="white", stroke_width=1, stroke_fill="black")
+#         im_p = Image.fromarray(colorize(p_sl))
+#         draw = ImageDraw.Draw(im_p)
+#         draw.text((5,5), "PRED", fill="white", stroke_width=1, stroke_fill="black")
 
-        # 4) side‐by‐side composite
-        w, h = im_t.size
-        combo = Image.new("RGB", (w*2, h), color=(240,240,240))
-        combo.paste(im_t, (0,0))
-        combo.paste(im_p, (w,0))
+#         # 4) side‐by‐side composite
+#         w, h = im_t.size
+#         combo = Image.new("RGB", (w*2, h), color=(240,240,240))
+#         combo.paste(im_t, (0,0))
+#         combo.paste(im_p, (w,0))
 
-        frames.append(combo)
+#         frames.append(combo)
 
-    # 5) save to GIF and log it
-    gif_path = os.path.join(output_dir, f"seg_comparison_{view}.gif")
-    frames[0].save(
-        gif_path,
-        format="GIF",
-        save_all=True,
-        append_images=frames[1:],
-        duration=duration,
-        loop=0
-    )
+#     # 5) save to GIF and log it
+#     gif_path = os.path.join(output_dir, f"seg_comparison_{view}.gif")
+#     frames[0].save(
+#         gif_path,
+#         format="GIF",
+#         save_all=True,
+#         append_images=frames[1:],
+#         duration=duration,
+#         loop=0
+#     )
 
-    if step is not None:
-        wandb.log({tag: wandb.Video(gif_path, format="gif")}, step=step)
-    else:
-        wandb.log({tag: wandb.Video(gif_path, format="gif")})
+#     if step is not None:
+#         wandb.log({tag: wandb.Video(gif_path, format="gif")}, step=step)
+#     else:
+#         wandb.log({tag: wandb.Video(gif_path, format="gif")})
 
-    os.remove(gif_path)
+#     os.remove(gif_path)
 
 def log_fullvol_views_gif(
     true_mask: np.ndarray,
@@ -465,16 +466,52 @@ def compute_absolute_volumes(seg: np.ndarray, voxel_volume: float = RESOLUTION**
 def compute_total_brain_volume(seg: np.ndarray, voxel_volume: float = RESOLUTION**3):
     return (seg != 0).sum() * voxel_volume
 
+def parse_fold_id(s: str) -> int:
+    m = re.search(r'(\d+)', str(s))
+    if not m:
+        raise ValueError(f"Could not parse fold id from: {s}")
+    return int(m.group(1))  # returns 1..5 if you pass 1..5
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--test_csv",      required=True,
                         help="CSV with a 'split' column including 'test'")
     parser.add_argument("--pred_dir",      required=True,
                         help="Where predict_cond_decoder.py saved T2pred and T2segtform")
+    parser.add_argument("--fold", type=str, default=None,
+                        help="Fold id or label (e.g., 0, 1, 2, 3, 4 or 'fold_0'). "
+                             "If set, test set = rows where split == fold.")
+    # optional flexibility if your schema uses different names
+    parser.add_argument("--split_col", type=str, default="split",
+                        help="Column with fold ids (default: 'split').")
     parser.add_argument("--out_dir",       required=True,
                         help="Where to save SynthSeg outputs and logs")
     args = parser.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
+
+    # ----------------------
+    # Select the test subset
+    # ----------------------
+    df = pd.read_csv(args.test_csv)
+    if args.fold is not None:
+        fold_id = parse_fold_id(args.fold)
+        if args.split_col not in df.columns:
+            raise KeyError(f"'{args.split_col}' column not found in {args.test_csv}")
+        # compare robustly regardless of dtype (int/str)
+        test = df[df[args.split_col].astype(str) == str(fold_id)].reset_index(drop=True)
+        split_desc = f"{args.split_col} == {fold_id}"
+    else:
+        # backward-compat: old behavior using 'test' strings
+        if "split" in df.columns:
+            test = df[df["split"] == "test"].reset_index(drop=True)
+            split_desc = "split == 'test'"
+        else:
+            raise KeyError("No --fold provided and no 'split'=='test' column found.")
+
+    if len(test) == 0:
+        raise RuntimeError(f"No rows matched ({split_desc}). Check your CSV and --fold.")
+
+    print(f"[Eval] Using {len(test)} samples for evaluation ({split_desc}).")
 
     seg_pipe = Compose([
         LoadImageD(keys=['seg'], image_only=True),
@@ -492,36 +529,32 @@ if __name__ == "__main__":
         mode="offline"
     )
 
-    # 1) read in your test set
-    df   = pd.read_csv(args.test_csv)
-    test = df[df.split == 'test'].reset_index(drop=True)
+    # 2) build the two lists of input/output paths
+    pred_seg_pairs = []
+    for _, row in test.iterrows():
+        sid      = row.subject_id
+        T1, T2   = row.starting_image_uid, row.followup_image_uid
+        pred_nii = os.path.join(args.pred_dir, f"{sid}_{T1}_{T2}_T2pred.nii.gz")
+        out_seg  = os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2pred_seg.nii.gz")
+        pred_seg_pairs.append((pred_nii, out_seg))
 
-    # # 2) build the two lists of input/output paths
-    # pred_seg_pairs = []
-    # for _, row in test.iterrows():
-    #     sid      = row.subject_id
-    #     T1, T2   = row.starting_image_uid, row.followup_image_uid
-    #     pred_nii = os.path.join(args.pred_dir, f"{sid}_{T1}_{T2}_T2pred.nii.gz")
-    #     out_seg  = os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2pred_seg.nii.gz")
-    #     pred_seg_pairs.append((pred_nii, out_seg))
+    # 3) write them to disk
+    with open("temp-input.txt","w")  as f_in, \
+         open("temp-output.txt","w") as f_out:
+        for pred, seg in pred_seg_pairs:
+            f_in.write(f"{pred}\n")
+            f_out.write(f"{seg}\n")
 
-    # # 3) write them to disk
-    # with open("temp-input.txt","w")  as f_in, \
-    #      open("temp-output.txt","w") as f_out:
-    #     for pred, seg in pred_seg_pairs:
-    #         f_in.write(f"{pred}\n")
-    #         f_out.write(f"{seg}\n")
-
-    # # 4) run *one* SynthSeg on all of them
-    # subprocess.run([
-    #     "mri_synthseg",
-    #     "--i", "temp-input.txt",
-    #     "--o", "temp-output.txt",
-    #     "--threads", "8",    # or whatever you like
-    #     "--cpu"
-    # ], check=True)
-    # os.remove("temp-input.txt")
-    # os.remove("temp-output.txt")
+    # 4) run *one* SynthSeg on all of them
+    subprocess.run([
+        "mri_synthseg",
+        "--i", "temp-input.txt",
+        "--o", "temp-output.txt",
+        "--threads", "8",    # or whatever you like
+        "--cpu"
+    ], check=True)
+    os.remove("temp-input.txt")
+    os.remove("temp-output.txt")
 
     # 5) now load them all back, compute dice + gif logs
     results = []
@@ -530,6 +563,8 @@ if __name__ == "__main__":
         T1, T2   = row.starting_image_uid, row.followup_image_uid
         age_0 = row.starting_age
         age_1 = row.followup_age
+        age_0_years = row.starting_age_bef_norm 
+        age_1_years = row.followup_age_bef_norm
         sex = row.sex
         # paths must match the order above
         pred_seg = os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2pred_seg.nii.gz")
@@ -537,18 +572,18 @@ if __name__ == "__main__":
         true_seg = row.followup_segm_path
 
         # -- also preprocess & save the T2 *ground-truth* segmentation
-        # seg_arr = seg_pipe({'seg': row.followup_segm_path})['seg']
-        # # cast to int32
-        # seg_arr = seg_arr.astype(np.int32)
-        # nib.save(nib.Nifti1Image(seg_arr[0], MNI152_1P5MM_AFFINE),
-        #          os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2segtform.nii.gz"))
+        seg_arr = seg_pipe({'seg': row.followup_segm_path})['seg']
+        # cast to int32
+        seg_arr = seg_arr.astype(np.int32)
+        nib.save(nib.Nifti1Image(seg_arr[0], MNI152_1P5MM_AFFINE),
+                 os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2segtform.nii.gz"))
 
-        # # # # -- also preprocess & save the T2 *predicted* segmentation
-        # seg_arr = seg_pipe({'seg': pred_seg})['seg']
-        # # cast to int32
-        # seg_arr = seg_arr.astype(np.int32)
-        # nib.save(nib.Nifti1Image(seg_arr[0], MNI152_1P5MM_AFFINE),
-        #          os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2pred_segtform.nii.gz"))
+        # # # -- also preprocess & save the T2 *predicted* segmentation
+        seg_arr = seg_pipe({'seg': pred_seg})['seg']
+        # cast to int32
+        seg_arr = seg_arr.astype(np.int32)
+        nib.save(nib.Nifti1Image(seg_arr[0], MNI152_1P5MM_AFFINE),
+                 os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2pred_segtform.nii.gz"))
 
         pred_seg = os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2pred_segtform.nii.gz")
         true_seg = os.path.join(args.pred_dir, f"{sid}_{T1}_{T2}_T2segtform.nii.gz")
@@ -572,6 +607,8 @@ if __name__ == "__main__":
             "subject_id": sid,
             "age_0":      age_0,
             "age_1":      age_1,
+            "age_0_years":      age_0_years,
+            "age_1_years":      age_1_years,
             "sex":        sex,
         }
         # build the list of all label-names (you can filter out 'background' if you like)
@@ -644,7 +681,7 @@ if __name__ == "__main__":
         # )
 
     # finally write out your CSV
-    summary_csv = os.path.join(args.out_dir, "test_dice_scores_vols_all.csv")
+    summary_csv = os.path.join(args.out_dir, f"test_dice_scores_vols_{args.fold}.csv")
     pd.DataFrame(results).to_csv(summary_csv, index=False)
     wandb.save(summary_csv)
     wandb.finish()
