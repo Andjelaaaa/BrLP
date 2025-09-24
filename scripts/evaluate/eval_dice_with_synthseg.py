@@ -484,6 +484,8 @@ if __name__ == "__main__":
     # optional flexibility if your schema uses different names
     parser.add_argument("--split_col", type=str, default="split",
                         help="Column with fold ids (default: 'split').")
+    parser.add_argument("--all",       type=bool, default=None,
+                   help="If to use all elements in csv as test")
     parser.add_argument("--out_dir",       required=True,
                         help="Where to save SynthSeg outputs and logs")
     args = parser.parse_args()
@@ -500,6 +502,10 @@ if __name__ == "__main__":
         # compare robustly regardless of dtype (int/str)
         test = df[df[args.split_col].astype(str) == str(fold_id)].reset_index(drop=True)
         split_desc = f"{args.split_col} == {fold_id}"
+        print(f"[Eval] Using {len(test)} samples for evaluation ({split_desc}).")
+    elif args.all:
+        test = df
+        print(f"[Eval] Using {len(test)} samples from the full dataframe.")
     else:
         # backward-compat: old behavior using 'test' strings
         if "split" in df.columns:
@@ -507,11 +513,12 @@ if __name__ == "__main__":
             split_desc = "split == 'test'"
         else:
             raise KeyError("No --fold provided and no 'split'=='test' column found.")
+        print(f"[Eval] Using {len(test)} samples for evaluation ({split_desc}).")
 
     if len(test) == 0:
-        raise RuntimeError(f"No rows matched ({split_desc}). Check your CSV and --fold.")
+        raise RuntimeError(f"No rows matched. Check your CSV and --fold.")
 
-    print(f"[Eval] Using {len(test)} samples for evaluation ({split_desc}).")
+    
 
     seg_pipe = Compose([
         LoadImageD(keys=['seg'], image_only=True),
@@ -535,26 +542,36 @@ if __name__ == "__main__":
         sid      = row.subject_id
         T1, T2   = row.starting_image_uid, row.followup_image_uid
         pred_nii = os.path.join(args.pred_dir, f"{sid}_{T1}_{T2}_T2pred.nii.gz")
+        if args.all:
+            pred_nii = os.path.join(args.pred_dir, f"{sid}_{T1}_{T2}_ens-median.nii.gz")
         out_seg  = os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2pred_seg.nii.gz")
         pred_seg_pairs.append((pred_nii, out_seg))
 
-    # 3) write them to disk
-    with open("temp-input.txt","w")  as f_in, \
-         open("temp-output.txt","w") as f_out:
+    in_list  = os.path.join(args.out_dir, "temp-input.txt")
+    out_list = os.path.join(args.out_dir, "temp-output.txt")
+
+    # write the lists
+    with open(in_list, "w") as f_in, open(out_list, "w") as f_out:
         for pred, seg in pred_seg_pairs:
             f_in.write(f"{pred}\n")
             f_out.write(f"{seg}\n")
 
-    # 4) run *one* SynthSeg on all of them
-    subprocess.run([
-        "mri_synthseg",
-        "--i", "temp-input.txt",
-        "--o", "temp-output.txt",
-        "--threads", "8",    # or whatever you like
-        "--cpu"
-    ], check=True)
-    os.remove("temp-input.txt")
-    os.remove("temp-output.txt")
+    # choose threads sensibly (e.g., SLURM_CPUS_PER_TASK or fallback)
+    threads = str(int(os.getenv("SLURM_CPUS_PER_TASK", "8")))
+
+    # run SynthSeg, pointing to the full paths
+    try:
+        subprocess.run(
+            ["mri_synthseg", "--i", in_list, "--o", out_list, "--threads", threads, "--cpu"],
+            check=True,
+        )
+    finally:
+        # always try to clean up
+        for p in (in_list, out_list):
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
 
     # 5) now load them all back, compute dice + gif logs
     results = []
@@ -568,15 +585,15 @@ if __name__ == "__main__":
         sex = row.sex
         # paths must match the order above
         pred_seg = os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2pred_seg.nii.gz")
-        # true_seg = os.path.join(args.pred_dir, f"{sid}_{T1}_{T2}_T2segtform.nii.gz")
-        true_seg = row.followup_segm_path
-
+        true_seg = os.path.join(args.pred_dir, f"{sid}_{T1}_{T2}_T2segtform.nii.gz")
+        
+        # true_seg = row.followup_segm_path
         # -- also preprocess & save the T2 *ground-truth* segmentation
-        seg_arr = seg_pipe({'seg': row.followup_segm_path})['seg']
-        # cast to int32
-        seg_arr = seg_arr.astype(np.int32)
-        nib.save(nib.Nifti1Image(seg_arr[0], MNI152_1P5MM_AFFINE),
-                 os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2segtform.nii.gz"))
+        # seg_arr = seg_pipe({'seg': row.followup_segm_path})['seg']
+        # # cast to int32
+        # seg_arr = seg_arr.astype(np.int32)
+        # nib.save(nib.Nifti1Image(seg_arr[0], MNI152_1P5MM_AFFINE),
+        #          os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2segtform.nii.gz"))
 
         # # # -- also preprocess & save the T2 *predicted* segmentation
         seg_arr = seg_pipe({'seg': pred_seg})['seg']
@@ -589,7 +606,8 @@ if __name__ == "__main__":
         true_seg = os.path.join(args.pred_dir, f"{sid}_{T1}_{T2}_T2segtform.nii.gz")
 
         pred_seg_transformed = os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2pred_segtform.nii.gz")
-        true_seg_transformed = os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2segtform.nii.gz")
+        # true_seg_transformed = os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2segtform.nii.gz")
+        true_seg_transformed = true_seg
 
         # load
         p = nib.load(pred_seg_transformed).get_fdata().astype(np.int32)

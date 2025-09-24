@@ -21,6 +21,8 @@ if __name__=="__main__":
     p.add_argument("--out_dir",    required=True)
     p.add_argument("--fold",       type=int, default=None,
                    help="If set, test set = rows where split == fold.")
+    p.add_argument("--all",       type=bool, default=None,
+                   help="If to use all elements in csv as test")
     p.add_argument("--split_col", type=str, default="split",
                         help="Column with fold ids (default: 'split').")
     args = p.parse_args()
@@ -34,6 +36,8 @@ if __name__=="__main__":
             raise KeyError(f"'split' column not found in {args.csv}")
         test = df[df["split"] == args.fold].reset_index(drop=True)
         sel_desc = f"split == {args.fold}"
+        if args.all:
+            test = df
     else:
         # fallback to legacy behavior if no fold provided
         if "split" not in df.columns:

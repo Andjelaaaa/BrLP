@@ -186,5 +186,10 @@ if __name__ == '__main__':
     # csv_C.to_csv(os.path.join(args.output_path, 'C_nonnormed_vol.csv'), index=False)
 
     print('> Creating CSV B\n')
-    csv_B = make_csv_B(df)
-    csv_B.to_csv(os.path.join(args.output_path, 'B_combined-dataset.csv'), index=False)
+    # csv_B = make_csv_B(df)
+    # csv_B.to_csv(os.path.join(args.output_path, 'B_combined-dataset.csv'), index=False)
+
+    # CSV for external validation
+    subset = df.loc[df['dataset'] == 'hc-new-england']
+    csv_B = make_csv_B(subset)
+    csv_B.to_csv(os.path.join(args.output_path, 'external_long.csv'), index=False)
