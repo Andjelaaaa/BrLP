@@ -12,7 +12,9 @@ from torch.nn import L1Loss
 import copy
 from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+from monai.data import MetaTensor
 import wandb
 from PIL import Image
 
@@ -113,9 +115,38 @@ train_aug = Compose([
                 translate_range=(1,1,1), scale_range=(0.02,0.02,0.02), mode='bilinear')
 ])
 
-# @torch.no_grad()
-def enc_mu(enc, x):                     # use mean, not a stochastic sample
-    mu, _ = enc.encode(x)
+# # @torch.no_grad()
+# def enc_mu(enc, x):                     # use mean, not a stochastic sample
+#     mu, _ = enc.encode(x)
+#     return mu
+
+# # --- grad-enabled, chunked encoder forward (no checkpoint needed) ---
+# def encode_mu_grad_chunked(ae, x, chunk=1):
+#     outs = []
+#     B = x.size(0)
+#     for i in range(0, B, chunk):
+#         xi = x[i:i+chunk]
+#         mu, _ = ae.encode(xi)          # keep grad wrt xi
+#         outs.append(mu)
+#     return torch.cat(outs, dim=0)      # [B, C_lat, D_lat, H_lat, W_lat]
+
+def _to_plain(x):
+    return x.as_tensor() if isinstance(x, MetaTensor) else x
+
+def encode_mu_grad_chunked(ae, x, chunk=1):
+    outs = []
+    for i in range(0, x.size(0), chunk):
+        xi = x[i:i+chunk]
+        def f(inp):
+            mu, _ = ae.encode(inp)
+            return mu
+        mu = checkpoint(f, xi)    # grad path, memory-friendly
+        outs.append(mu)
+    return torch.cat(outs, dim=0)
+
+@torch.no_grad()
+def enc_mu_nograd(ae, x):
+    mu, _ = ae.encode(x)
     return mu
 
 def enc_mu_ckpt(ae, x):
@@ -377,20 +408,39 @@ def tau_months_smooth(age0_m: torch.Tensor,
     # when age is large, s→1 → tau≈tau_old
     return tau_old + (tau_young - tau_old) * (1.0 - s)
 
-def small_step_weight_months(age0_norm: torch.Tensor,
-                             age1_norm: torch.Tensor,
-                             **tau_kwargs):
+def small_step_weight_months(age0, age1, *,  # ages normalized [0,1]
+                             tau_mode="smooth",  # "smooth" or "piecewise"
+                             # piecewise params:
+                             young_cut=24.0, mid_cut=48.0,
+                             tau_young=9.0, tau_mid=6.0, tau_old=3.0,
+                             # smooth params:
+                             pivot=36.0, steep=0.12,
+                             tau_young_s=9.0, tau_old_s=3.0):
     """
     age0_norm, age1_norm: [B,1] normalized to [0,1] where 0≡12mo, 1≡84mo.
     Returns weights w in [0,1] shaped [B,1], computed in **months**.
     """
-    age0_m = norm_to_months(age0_norm)               # [B,1] months
-    age1_m = norm_to_months(age1_norm)               # [B,1] months
+    age0_m = norm_to_months(age0)               # [B,1] months
+    age1_m = norm_to_months(age1)               # [B,1] months
     d_m    = (age1_m - age0_m).abs()                 # [B,1] Δmonths
 
-    tau_m  = tau_months_smooth(age0_m.squeeze(1), **tau_kwargs).unsqueeze(1)  # [B,1] months
-    w      = torch.exp(-(d_m / (tau_m + 1e-6))**2)  # [B,1]
-    return w
+    if tau_mode == "piecewise":
+        tau = tau_months_by_age0(
+            age0_m.squeeze(1),
+            young_cut=young_cut, mid_cut=mid_cut,
+            tau_young=tau_young, tau_mid=tau_mid, tau_old=tau_old
+        ).unsqueeze(1)  # [B,1]
+    elif tau_mode == "smooth":
+        tau = tau_months_smooth(
+            age0_m.squeeze(1),
+            tau_young=tau_young_s, tau_old=tau_old_s,
+            pivot=pivot, steep=steep
+        ).unsqueeze(1)  # [B,1]
+    else:
+        raise ValueError(f"Unknown tau_mode: {tau_mode}")
+    
+    w_id = torch.exp(- d_m / tau.clamp_min(1e-6))  # [B,1]
+    return w_id
 
 # 1) MLP takes 3-dim input now, triplets of age0, age1 and delta_age
 class AgeEmbedMLP(nn.Module):
@@ -803,7 +853,11 @@ if __name__ == '__main__':
             # ── Generator (“conditional decoder”) step ─────────────
             with autocast(enabled=True):
                 x1_pred = model(img0, age0, age1)  
-                z_pred = enc_mu_ckpt(autoencoder, x1_pred).view(x1_pred.size(0), -1)
+
+                x1_small = F.avg_pool3d(_to_plain(x1_pred), 2, 2)
+                z_pred   = encode_mu_grad_chunked(autoencoder, x1_small, chunk=1).view(x1_small.size(0), -1)
+
+                # z_pred = encode_mu_grad_chunked(autoencoder, x1_pred).view(x1_pred.size(0), -1)
 
                 # batch-level within-subject loss when ≥2 from same subject
                 l_within = within_subject_latent_loss(z_pred, age1.squeeze(1), subject_id, sigma=0.1)
@@ -834,16 +888,19 @@ if __name__ == '__main__':
 
                 loss_g = rec_loss + gen_adv_loss + perc_loss + within_weight * l_within + two_view_weight * l_two_view
                 with torch.no_grad():
-                    z0     = enc_mu(autoencoder, img0).view(img0.size(0), -1)
+                    # z0     = enc_mu(autoencoder, img0).view(img0.size(0), -1)
+                    x0_small = F.avg_pool3d(_to_plain(img0), 2, 2)
+                    z0       = enc_mu_nograd(autoencoder, x0_small).view(x0_small.size(0), -1)
 
                 # ages in months
                 age0_m = norm_to_months(age0)           # [B,1]
                 age1_m = norm_to_months(age1)           # [B,1]
                 d_m     = (age1_m - age0_m).abs()       # [B,1]  Δmonths
 
-                w_id   = small_step_weight_months(age0, age1,
-                                                young_cut=24.0, mid_cut=48.0,
-                                                tau_young=9.0, tau_mid=6.0, tau_old=3.0)   # tune here
+                w_id = small_step_weight_months(
+                    age0, age1, tau_mode="smooth",
+                    pivot=36.0, steep=0.12, tau_young_s=9.0, tau_old_s=3.0
+                )
 
                 # apply weight per-sample
                 l_id_lat_per = (z_pred - z0).pow(2).mean(dim=1, keepdim=True)   # [B,1]
@@ -898,6 +955,8 @@ if __name__ == '__main__':
             avgloss.put('RegID/dmonths_mean',      d_m_mean.item())
             avgloss.put('RegID/id_contrib',        id_contrib.item())
 
+            if (step % 50) == 0: torch.cuda.empty_cache()
+
             if step % 5 == 0:
                 progress_bar.set_postfix({
                     "g_rec": f"{rec_loss.item():.4f}",
@@ -908,14 +967,32 @@ if __name__ == '__main__':
                     "g_total": f"{loss_g.item():.4f}",
                     "d": f"{loss_d.item():.4f}",
                 })
-            if step % 50 == 0:
+            if total_counter % 50 == 0:
+                it = total_counter 
+
+                # flatten, sanitize, and move to numpy
+                w_np = w_id.detach().float().view(-1)
+                d_np = d_m.detach().float().view(-1)
+
+                # remove non-finite just in case
+                w_np = w_np[torch.isfinite(w_np)]
+                d_np = d_np[torch.isfinite(d_np)]
+
+                w_np = w_np.cpu().numpy()
+                d_np = d_np.cpu().numpy()
+
                 wandb.log({
-                    "hist/w_id": wandb.Histogram(w_id.detach().cpu().numpy().ravel()),
-                    "hist/d_months": wandb.Histogram(d_m.detach().cpu().numpy().ravel())
+                    "hist/w_id": wandb.Histogram(w_np, num_bins=30),
+                    "hist/d_months": wandb.Histogram(d_np, num_bins=30),
+                    # handy scalars
+                    "stat/w_id_mean": float(w_np.mean()) if w_np.size else 0.0,
+                    "stat/w_id_min":  float(w_np.min())  if w_np.size else 0.0,
+                    "stat/w_id_max":  float(w_np.max())  if w_np.size else 0.0,
+                    "stat/dm_mean":   float(d_np.mean()) if d_np.size else 0.0,
                 }, step=it)
 
             if total_counter % 10 == 0:
-                it = total_counter // 10
+                it = total_counter #// 10
                 # Log average losses every 10 iters
                 metrics = {
                     'train/gen/rec_loss': avgloss.pop_avg('Generator/rec_loss'),
