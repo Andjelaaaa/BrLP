@@ -450,6 +450,12 @@ def compute_relative_volumes(seg: np.ndarray, voxel_volume: float = RESOLUTION**
         relative_vols[f"relvol_{name}"] = rel_vol
     return relative_vols
 
+def voxel_volume_from_img(img: nib.Nifti1Image) -> float:
+    # robust to rotations: takes norms of the 3x3 affine columns
+    vs = nib.affines.voxel_sizes(img.affine)
+    print('Voxel volume is:', float(np.prod(vs)))
+    return float(np.prod(vs))
+
 def compute_absolute_volumes(seg: np.ndarray, voxel_volume: float = RESOLUTION**3):
     """
     Compute absolute volume (mm³) for each region in the segmentation.
@@ -585,7 +591,11 @@ if __name__ == "__main__":
         sex = row.sex
         # paths must match the order above
         pred_seg = os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2pred_seg.nii.gz")
-        true_seg = os.path.join(args.pred_dir, f"{sid}_{T1}_{T2}_T2segtform.nii.gz")
+        # true_seg = os.path.join(args.pred_dir, f"{sid}_{T1}_{T2}_T2segtform.nii.gz")
+
+        # For native space
+        true_seg = os.path.join('/home/andim/projects/def-bedelb/andim/brlp-data/', f"{sid}_{T2}_segm.nii.gz")
+        t1_seg = os.path.join('/home/andim/projects/def-bedelb/andim/brlp-data/', f"{sid}_{T1}_segm.nii.gz")
         
         # true_seg = row.followup_segm_path
         # -- also preprocess & save the T2 *ground-truth* segmentation
@@ -594,31 +604,43 @@ if __name__ == "__main__":
         # seg_arr = seg_arr.astype(np.int32)
         # nib.save(nib.Nifti1Image(seg_arr[0], MNI152_1P5MM_AFFINE),
         #          os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2segtform.nii.gz"))
-
+        ###########
         # # # -- also preprocess & save the T2 *predicted* segmentation
-        seg_arr = seg_pipe({'seg': pred_seg})['seg']
-        # cast to int32
-        seg_arr = seg_arr.astype(np.int32)
-        nib.save(nib.Nifti1Image(seg_arr[0], MNI152_1P5MM_AFFINE),
-                 os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2pred_segtform.nii.gz"))
+        # seg_arr = seg_pipe({'seg': pred_seg})['seg']
+        # # cast to int32
+        # seg_arr = seg_arr.astype(np.int32)
+        # nib.save(nib.Nifti1Image(seg_arr[0], MNI152_1P5MM_AFFINE),
+        #          os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2pred_segtform.nii.gz"))
 
-        pred_seg = os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2pred_segtform.nii.gz")
-        true_seg = os.path.join(args.pred_dir, f"{sid}_{T1}_{T2}_T2segtform.nii.gz")
+        # pred_seg = os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2pred_segtform.nii.gz")
+        # true_seg = os.path.join(args.pred_dir, f"{sid}_{T1}_{T2}_T2segtform.nii.gz")
 
-        pred_seg_transformed = os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2pred_segtform.nii.gz")
-        # true_seg_transformed = os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2segtform.nii.gz")
-        true_seg_transformed = true_seg
+        # pred_seg_transformed = os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2pred_segtform.nii.gz")
+        # # true_seg_transformed = os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2segtform.nii.gz")
+        # true_seg_transformed = true_seg
 
         # load
-        p = nib.load(pred_seg_transformed).get_fdata().astype(np.int32)
-        t = nib.load(true_seg_transformed).get_fdata().astype(np.int32)
+        # p = nib.load(pred_seg_transformed).get_fdata().astype(np.int32)
+        # t = nib.load(true_seg_transformed).get_fdata().astype(np.int32)
+
+        pred_img = nib.load(pred_seg)
+        true_img = nib.load(true_seg)
+        t1_img = nib.load(t1_seg)
+
+        p = pred_img.get_fdata().astype(np.int32)
+        t = true_img.get_fdata().astype(np.int32)
+        t1 = t1_img.get_fdata().astype(np.int32)
+
+        voxvol_pred = voxel_volume_from_img(pred_img)
+        voxvol_true = voxel_volume_from_img(true_img)
 
         # per-label dice
         dice_scores = compute_dice_per_label(p, t)
 
         # relative volumes
-        relvol_pred = compute_relative_volumes(p)
-        relvol_true = compute_relative_volumes(t)
+        relvol_pred = compute_relative_volumes(p, voxel_volume=voxvol_pred)
+        relvol_true = compute_relative_volumes(t, voxel_volume=voxvol_true)
+        relvol_t1 = compute_relative_volumes(t1, voxel_volume=voxvol_true) 
         
         # build a single record for this subject
         rec = {
@@ -655,17 +677,23 @@ if __name__ == "__main__":
             rec[k + "_gt"] = v
         for k, v in relvol_pred.items():
             rec[k + "_pred"] = v
+        for k, v in relvol_t1.items():
+            rec[k + "_t1"] = v
 
-        absvol_pred = compute_absolute_volumes(p)
-        absvol_true = compute_absolute_volumes(t)
+        absvol_pred = compute_absolute_volumes(p, voxel_volume=voxvol_pred)
+        absvol_true = compute_absolute_volumes(t, voxel_volume=voxvol_true)
+        absvol_t1 = compute_absolute_volumes(t1, voxel_volume=voxvol_true)
 
         for k, v in absvol_pred.items():
             rec[k + "_pred"] = v
         for k, v in absvol_true.items():
             rec[k + "_gt"] = v
+        for k, v in absvol_t1.items():
+            rec[k + "_t1"] = v
 
         rec["total_volume_pred"] = compute_total_brain_volume(p)
         rec["total_volume_gt"]   = compute_total_brain_volume(t)
+        rec["total_volume_t1"]   = compute_total_brain_volume(t1)
 
         results.append(rec)
 

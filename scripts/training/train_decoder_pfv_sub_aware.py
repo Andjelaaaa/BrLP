@@ -1,5 +1,6 @@
 import os
 import argparse
+import math
 import warnings
 from datetime import datetime
 import pandas as pd
@@ -13,7 +14,7 @@ import copy
 from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import checkpoint, checkpoint_sequential
 from monai.data import MetaTensor
 import wandb
 from PIL import Image
@@ -39,6 +40,8 @@ import random
 from collections import defaultdict, Counter
 from torch.utils.data import Sampler
 import time
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,garbage_collection_threshold:0.6,expandable_segments:True"
 
 def t(): return time.perf_counter()
 
@@ -133,15 +136,51 @@ train_aug = Compose([
 def _to_plain(x):
     return x.as_tensor() if isinstance(x, MetaTensor) else x
 
-def encode_mu_grad_chunked(ae, x, chunk=1):
+# def encode_mu_grad_chunked(ae, x, chunk=1):
+#     outs = []
+#     for i in range(0, x.size(0), chunk):
+#         xi = x[i:i+chunk]
+#         def f(inp):
+#             mu, _ = ae.encode(inp)
+#             return mu
+#         mu = checkpoint(f, xi)    # grad path, memory-friendly
+#         outs.append(mu)
+#     return torch.cat(outs, dim=0)
+
+def encode_mu_grad_chunked(
+    ae,
+    x,                          # [B, C, D, H, W]
+    batch_chunk: int = 1,       # split the batch into micro-batches
+    segs: int = 4,              # split the encoder into N segments
+    use_reentrant: bool = False,# needs PyTorch >= 2.0 for checkpoint_sequential kw
+    amp: bool = True,           # run AE in autocast
+):
+    """
+    Memory-reduced encode that keeps grad w.r.t. x.
+    1) Splits batch into micro-chunks
+    2) Runs ae.encoder via checkpoint_sequential over 'segs' segments
+    3) Applies ae.quant_conv and returns mu (drops logvar)
+    """
     outs = []
-    for i in range(0, x.size(0), chunk):
-        xi = x[i:i+chunk]
-        def f(inp):
-            mu, _ = ae.encode(inp)
-            return mu
-        mu = checkpoint(f, xi)    # grad path, memory-friendly
+    B = x.size(0)
+
+    # Turn ae.encoder into a list of modules for checkpoint_sequential
+    enc_modules = list(ae.encoder.children())  # assumes nn.Sequential-like
+    # If your encoder isn't sequential, you can manually define a list of “stage” modules.
+
+    for i in range(0, B, batch_chunk):
+        xi = x[i:i+batch_chunk]
+
+        with torch.cuda.amp.autocast(enabled=amp):
+            # segmented forward with checkpointing
+            h = checkpoint_sequential(
+                enc_modules, segs, xi, use_reentrant=use_reentrant
+            )
+            moments = ae.quant_conv(h)
+            mu, _logvar = torch.chunk(moments, 2, dim=1)
+
         outs.append(mu)
+
     return torch.cat(outs, dim=0)
 
 @torch.no_grad()
@@ -156,17 +195,78 @@ def enc_mu_ckpt(ae, x):
         return mu
     return checkpoint(_fn, x)
 
-def two_view_consistency(autoencoder, x0, age0, age1, cond_pred_fn):
-    age0 = age0.to(x0.device).float()
-    age1 = age1.to(x0.device).float()
-    # view 1 (as is)
-    y1 = cond_pred_fn(x0, age0, age1)
-    z1 = enc_mu(autoencoder, y1).view(1, -1)
-    # view 2 (augmented baseline)
-    x0_aug = train_aug({'img': x0[0]})['img'].unsqueeze(0).to(x0.device)
-    y2 = cond_pred_fn(x0_aug, age0, age1)
-    z2 = enc_mu(autoencoder, y2).view(1, -1)
-    return ((z1 - z2)**2).mean()
+class SubjectTriadBatchSampler(Sampler):
+    """
+    Yields 3-sample batches, all from the same subject.
+    - If a subject has k samples, we emit ceil(k/3) batches.
+      Every real index is used exactly once per epoch.
+    - For the last chunk of size 1 or 2, we replicate one item to reach 3,
+      and mark those replicas with aug_flag=1 so the Dataset can augment input.
+    Output per batch: [(idx, aug_flag), (idx, aug_flag), (idx, aug_flag)]
+    """
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+        # Build per-subject index lists
+        if hasattr(dataset, "indices_by_subject"):
+            self.by_subj = {k: v[:] for k, v in dataset.indices_by_subject.items()}
+        else:
+            sids = getattr(dataset, "subject_ids", None)
+            if sids is None and hasattr(dataset, "df"):
+                sids = dataset.df["subject_id"].astype(str).tolist()
+            if sids is None:
+                raise ValueError("Dataset must expose subject_ids or df['subject_id']")
+            by = defaultdict(list)
+            for i, sid in enumerate(sids):
+                by[sid].append(i)
+            self.by_subj = dict(by)
+
+        self.subj_keys = list(self.by_subj.keys())
+
+    def __iter__(self):
+        # shuffle subjects each epoch
+        subjects = self.subj_keys[:]
+        random.shuffle(subjects)
+
+        for s in subjects:
+            pool = self.by_subj[s][:]
+            if len(pool) == 0:
+                continue
+            random.shuffle(pool)
+
+            # walk through subject indices in chunks of 3
+            for start in range(0, len(pool), 3):
+                chunk = pool[start:start+3]
+                n = len(chunk)
+                if n == 3:
+                    idxs = chunk
+                    aug  = [0, 0, 0]
+                elif n == 2:
+                    base = random.choice(chunk)
+                    idxs = [chunk[0], chunk[1], base]
+                    aug  = [0, 0, 1]
+                else:  # n == 1
+                    base = chunk[0]
+                    idxs = [base, base, base]
+                    aug  = [0, 1, 1]
+
+                yield list(zip(idxs, aug))
+
+    def __len__(self):
+        # number of triads per epoch = sum over subjects ceil(n_s/3)
+        return sum(math.ceil(len(v) / 3) for v in self.by_subj.values())
+
+# def two_view_consistency(autoencoder, x0, age0, age1, cond_pred_fn):
+#     age0 = age0.to(x0.device).float()
+#     age1 = age1.to(x0.device).float()
+#     # view 1 (as is)
+#     y1 = cond_pred_fn(x0, age0, age1)
+#     z1 = enc_mu(autoencoder, y1).view(1, -1)
+#     # view 2 (augmented baseline)
+#     x0_aug = train_aug({'img': x0[0]})['img'].unsqueeze(0).to(x0.device)
+#     y2 = cond_pred_fn(x0_aug, age0, age1)
+#     z2 = enc_mu(autoencoder, y2).view(1, -1)
+#     return ((z1 - z2)**2).mean()
 
 
 def log_recon_3x4_to_wandb(
@@ -552,6 +652,10 @@ class LongitudinalMRIDataset(Dataset):
         return len(self.df)
 
     def __getitem__(self, idx):
+        aug_flag = 0
+        if isinstance(idx, (tuple, list)):
+            # we accept (index, aug_flag)
+            idx, aug_flag = idx
         row = self.df.iloc[idx]
 
         # 1) Load volume‐0 (baseline) and volume‐1 (follow‐up)
@@ -568,7 +672,11 @@ class LongitudinalMRIDataset(Dataset):
         age0 = torch.tensor([age0], dtype=torch.float32)
         age1 = torch.tensor([age1], dtype=torch.float32)
 
-        # 3) Grab subject_id and followup_image_uid
+        # 3) If this item is a replicated “view”, apply augmentation to the input image (x0)
+        if aug_flag == 1:
+            img0 = train_aug({'img': img0})['img']
+
+        # 4) Grab subject_id and followup_image_uid
         subject_id     = row['subject_id']            # e.g. “sub-10098”
         # image_uid      = row['followup_image_uid']    # e.g. “ses-002”
 
@@ -693,34 +801,22 @@ if __name__ == '__main__':
     test_df  = dataset_df[dataset_df.split == fold].reset_index(drop=True)
     train_df = dataset_df[dataset_df.split != fold].reset_index(drop=True)
 
-    print(f"Training on folds {set(range(5)) - {fold}}; testing on fold {fold}")
-
     # ─── Datasets & DataLoaders ────────────────────────────────────
     train_ds = LongitudinalMRIDataset(
-        df=train_df,
-        resolution=config.resolution,
-        target_shape=config.input_shape
+    df=train_df,
+    resolution=config.resolution,
+    target_shape=config.input_shape
     )
-    batch_sampler = SubjectBalancedBatchSampler(
-    dataset=train_ds,
-    batch_size=config.max_batch_size,      # 3
-    subjects_per_batch=1,
-    samples_per_subject=config.max_batch_size,  # 3
-    with_replacement=True
-    )
+
+    batch_sampler = SubjectTriadBatchSampler(train_ds)
+
     train_loader = DataLoader(
         dataset=train_ds,
         batch_sampler=batch_sampler,
         num_workers=args.num_workers,
         pin_memory=True
     )
-    # train_loader = DataLoader(
-    #     dataset=train_ds,
-    #     batch_size=config.max_batch_size,
-    #     shuffle=True,
-    #     num_workers=args.num_workers,
-    #     pin_memory=True
-    # )
+
 
     # ─── Load pretrained AutoencoderKL and Discriminator ────────────
     autoencoder = init_autoencoder(config.aekl_ckpt).to(DEVICE)
@@ -780,7 +876,7 @@ if __name__ == '__main__':
     # pulls predicted latents closer, with stronger pull when Δage is small.
     # Improves subject-specific temporal coherence.
 
-    two_view_weight = 0.1
+    # two_view_weight = 0.1
     # Two-view consistency for singletons (when only one pair for a subject is in-batch).
     # Predict from x0 and an augmented x0; make their predicted latents agree.
     # Acts like self-consistency when no second timepoint from the same subject is present.
@@ -854,22 +950,16 @@ if __name__ == '__main__':
             with autocast(enabled=True):
                 x1_pred = model(img0, age0, age1)  
 
-                x1_small = F.avg_pool3d(_to_plain(x1_pred), 2, 2)
-                z_pred   = encode_mu_grad_chunked(autoencoder, x1_small, chunk=1).view(x1_small.size(0), -1)
-
+                # x1_small = F.avg_pool3d(_to_plain(x1_pred), 4, 4)
+                # z_pred   = encode_mu_grad_chunked(autoencoder, x1_small, chunk=2, use_reentrant=False).view(x1_small.size(0), -1)
+                x1_small = F.avg_pool3d(_to_plain(x1_pred), 4, 4)  # stronger pooling to shrink graph
+                z_pred   = encode_mu_grad_chunked(
+                    autoencoder, x1_small, batch_chunk=2, segs=6, use_reentrant=False, amp=True
+                ).view(x1_small.size(0), -1)
                 # z_pred = encode_mu_grad_chunked(autoencoder, x1_pred).view(x1_pred.size(0), -1)
 
-                # batch-level within-subject loss when ≥2 from same subject
+                # batch-level within-subject loss from same subject
                 l_within = within_subject_latent_loss(z_pred, age1.squeeze(1), subject_id, sigma=0.1)
-
-                # singleton subjects → add two-view consistency
-                l_two_view = torch.zeros((), device=DEVICE)
-                ids = subject_id.tolist() if isinstance(subject_id, torch.Tensor) else list(subject_id)
-                cnt = Counter(ids)
-                for i, sid in enumerate(ids):
-                    if cnt[sid] == 1:
-                        l_two_view = l_two_view + two_view_consistency(autoencoder, img0[i:i+1], age0[i:i+1], age1[i:i+1], model)
-
 
                 # Discriminator on fake → generator adv‐loss
                 logits_fake = discriminator(x1_pred.contiguous().float())[-1]
@@ -886,7 +976,7 @@ if __name__ == '__main__':
                 # We skip KLD since encoder is frozen
                 # kld_loss = torch.tensor(0.0).to(DEVICE)
 
-                loss_g = rec_loss + gen_adv_loss + perc_loss + within_weight * l_within + two_view_weight * l_two_view
+                loss_g = rec_loss + gen_adv_loss + perc_loss + within_weight * l_within
                 with torch.no_grad():
                     # z0     = enc_mu(autoencoder, img0).view(img0.size(0), -1)
                     x0_small = F.avg_pool3d(_to_plain(img0), 2, 2)
@@ -923,6 +1013,9 @@ if __name__ == '__main__':
 
                 loss_g = loss_g + lambda_id * l_id_lat
 
+            # ---- free big intermediates BEFORE backward ----
+            del x1_small, logits_fake
+            torch.cuda.empty_cache()
             gradacc_g.step(loss_g, step)
 
             # ── Discriminator step ─────────────────────────────────
@@ -945,7 +1038,7 @@ if __name__ == '__main__':
             avgloss.put('Generator/perc_loss', perc_loss.item())
             avgloss.put('Generator/within',     (within_weight * l_within).item())
             avgloss.put('Generator/within_raw', l_within.item())
-            avgloss.put('Generator/two_view',   (two_view_weight * l_two_view).item())
+            # avgloss.put('Generator/two_view',   (two_view_weight * l_two_view).item())
             avgloss.put('Generator/total',      loss_g.item())
             avgloss.put('Discriminator/loss', loss_d.item())
             avgloss.put('RegID/w_id_mean',         w_id_mean.item())
@@ -963,7 +1056,7 @@ if __name__ == '__main__':
                     "g_adv": f"{gen_adv_loss.item():.4f}",
                     "g_perc": f"{perc_loss.item():.4f}",
                     "g_within": f"{(within_weight * l_within).item():.4f}",
-                    "g_2view": f"{(two_view_weight * l_two_view).item():.4f}",
+                    # "g_2view": f"{(two_view_weight * l_two_view).item():.4f}",
                     "g_total": f"{loss_g.item():.4f}",
                     "d": f"{loss_d.item():.4f}",
                 })
@@ -999,7 +1092,7 @@ if __name__ == '__main__':
                     'train/gen/adv_loss': avgloss.pop_avg('Generator/adv_loss'),
                     'train/gen/perc_loss': avgloss.pop_avg('Generator/perc_loss'),
                     'train/gen/within':    avgloss.pop_avg('Generator/within'),
-                    'train/gen/two_view':  avgloss.pop_avg('Generator/two_view'),
+                    # 'train/gen/two_view':  avgloss.pop_avg('Generator/two_view'),
                     'train/gen/total':     avgloss.pop_avg('Generator/total'),
                     'train/disc/loss': avgloss.pop_avg('Discriminator/loss'),
                     'train/regid/w_id_mean':    avgloss.pop_avg('RegID/w_id_mean'),
@@ -1023,9 +1116,7 @@ if __name__ == '__main__':
                     recon0 = autoencoder.reconstruct(img0[:1])              # [1,1,D,H,W]
                 recon_vol = recon0[0, 0].detach().cpu().numpy()[None, ...]  # [1,D,H,W]
 
-                # 4) Convert normalized ages back to years (if needed)
-                # age0_years = age0[0].item() * 6.0 + 1.0
-                # age1_years = age1[0].item() * 6.0 + 1.0
+                # 4) Convert normalized ages back to months 
                 age0_months = age0[0].item() * (84.0-12.0) + 12.0
                 age1_months = age1[0].item() * (84.0-12.0) + 12.0
 
@@ -1047,69 +1138,63 @@ if __name__ == '__main__':
                 )
 
                 # 1) Compute recon_t0, recon_t1
-                with torch.no_grad():
-                    recon0 = autoencoder.reconstruct(img0[:1])
-                    recon1 = autoencoder.reconstruct(img1[:1])
-                recon_t0 = recon0[0,0].cpu().numpy()[None]
-                recon_t1 = recon1[0,0].cpu().numpy()[None]
+                # with torch.no_grad():
+                #     recon0 = autoencoder.reconstruct(img0[:1])
+                #     recon1 = autoencoder.reconstruct(img1[:1])
+                # recon_t0 = recon0[0,0].cpu().numpy()[None]
+                # recon_t1 = recon1[0,0].cpu().numpy()[None]
 
                 # 2) Compute diffs and log them
-                # D1 = true_vol[0] - baseline_vol[0] # T2true - T1
-                # D2 = true_vol[0] - recon_t0[0] #T2true - T1recon
-                D1 = np.abs(pred_vol[0] - true_vol[0]) #T2pred-T2true
-                D2 = np.abs(pred_vol[0] - baseline_vol[0]) #T2pred-T1
-                D3 = np.abs(pred_vol[0] - recon_t0[0]) #T2pred-T1recon
-                D4 = np.abs(true_vol[0] - baseline_vol[0]) #T2true-T1
-                D5 = np.abs(recon_t1[0] - recon_t0[0]) #T2recon-T1recon
-                m = max(D.max() for D in (D1,D2,D3,D4,D5))
-                iz = D1.shape[0]//2
-                # make a 1×5 figure
-                fig, axes = plt.subplots(1, 5, figsize=(15,4), constrained_layout=True)
-                titles = ["|T2pred–T2true|","|T2pred–T1|","|T2pred–T1recon|","|T2true–T1|","|T2recon–T1recon|"]
-                for ax, D, ttl in zip(axes, (D1,D2,D3,D4,D5), titles):
-                    im = ax.imshow(np.rot90(D[iz]), cmap="hot", vmin=0, vmax=m)
-                    ax.set_title(ttl, fontsize=9)
-                    ax.axis("off")
+                # D1 = np.abs(pred_vol[0] - true_vol[0]) #T2pred-T2true
+                # D2 = np.abs(pred_vol[0] - baseline_vol[0]) #T2pred-T1
+                # D3 = np.abs(pred_vol[0] - recon_t0[0]) #T2pred-T1recon
+                # D4 = np.abs(true_vol[0] - baseline_vol[0]) #T2true-T1
+                # D5 = np.abs(recon_t1[0] - recon_t0[0]) #T2recon-T1recon
+                # m = max(D.max() for D in (D1,D2,D3,D4,D5))
+                # iz = D1.shape[0]//2
+                # # make a 1×5 figure
+                # fig, axes = plt.subplots(1, 5, figsize=(15,4), constrained_layout=True)
+                # titles = ["|T2pred–T2true|","|T2pred–T1|","|T2pred–T1recon|","|T2true–T1|","|T2recon–T1recon|"]
+                # for ax, D, ttl in zip(axes, (D1,D2,D3,D4,D5), titles):
+                #     im = ax.imshow(np.rot90(D[iz]), cmap="hot", vmin=0, vmax=m)
+                #     ax.set_title(ttl, fontsize=9)
+                #     ax.axis("off")
 
-                # add single colorbar on the right
-                cbar = fig.colorbar(im, ax=axes, orientation="vertical", fraction=0.02, pad=0.01)
-                cbar.set_label("Abs. Error", rotation=90)
+                # # add single colorbar on the right
+                # cbar = fig.colorbar(im, ax=axes, orientation="vertical", fraction=0.02, pad=0.01)
+                # cbar.set_label("Abs. Error", rotation=90)
 
-                delta_age = age1_months - age0_months
-                fig.suptitle(f"Epoch {epoch} | {subject_id[0]}  |  ΔAge={delta_age:.2f} mo", fontsize=12)
-                # plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+                # delta_age = age1_months - age0_months
+                # fig.suptitle(f"Epoch {epoch} | {subject_id[0]}  |  ΔAge={delta_age:.2f} mo", fontsize=12)
+                # # plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
-                # save + log
-                tmpd = f"{args.output_dir}/abs_errors_e{epoch}_it{it}.png"
-                fig.savefig(tmpd, dpi=100)
-                plt.close(fig)
+                # # save + log
+                # tmpd = f"{args.output_dir}/abs_errors_e{epoch}_it{it}.png"
+                # fig.savefig(tmpd, dpi=100)
+                # plt.close(fig)
 
-                # log to W&B
-                wandb.log({ "Errors/5-way": wandb.Image(tmpd) }, step=it)
+                # # log to W&B
+                # wandb.log({ "Errors/5-way": wandb.Image(tmpd) }, step=it)
 
-                # keep the filename for the GIF
-                diff_frames.append(tmpd)
+                # # keep the filename for the GIF
+                # diff_frames.append(tmpd)
                 
-                # tmpd = f"tmp_err_{subject_id[0]}_{it}.png"
-                # fig.savefig(tmpd, dpi=100); plt.close(fig)
-                # wandb.log({"Errors/5-map": wandb.Image(tmpd)}, step=it)
-                # os.remove(tmpd)
 
                 # 3) If you want mean‐absolute‐errors of any pair:
-                mae_pred_true   = float(D1.mean())   # for T2pred–T2true
-                mae_pred_t1     = float(D2.mean())
-                mae_pred_t1rec  = float(D3.mean())
-                mae_true_t1     = float(D4.mean())
-                mae_recon_t1rec = float(D5.mean())
+                # mae_pred_true   = float(D1.mean())   # for T2pred–T2true
+                # mae_pred_t1     = float(D2.mean())
+                # mae_pred_t1rec  = float(D3.mean())
+                # mae_true_t1     = float(D4.mean())
+                # mae_recon_t1rec = float(D5.mean())
 
-                wandb.log({
-                    "mae/T2pred-T2true":      mae_pred_true,
-                    "mae/T2pred-T1":        mae_pred_t1,
-                    "mae/T2pred-T1recon":   mae_pred_t1rec,
-                    "mae/T2true-T1":        mae_true_t1,
-                    "mae/T2recon-T1recon":         mae_recon_t1rec,
-                    "delta_age":          delta_age
-                }, step=it)
+                # wandb.log({
+                #     "mae/T2pred-T2true":      mae_pred_true,
+                #     "mae/T2pred-T1":        mae_pred_t1,
+                #     "mae/T2pred-T1recon":   mae_pred_t1rec,
+                #     "mae/T2true-T1":        mae_true_t1,
+                #     "mae/T2recon-T1recon":         mae_recon_t1rec,
+                #     "delta_age":          delta_age
+                # }, step=it)
 
                 # 6) Log 3×3 grid of [baseline, true follow-up, pred follow-up]
                 # log_recon_comparison_to_wandb(
@@ -1148,23 +1233,24 @@ if __name__ == '__main__':
         print(f"Epoch {epoch} ▶︎ Train L1 = {avgloss.get_avg('Generator/rec_loss'):.4f}")
 
     # read back all frames in order
-    frames = [Image.open(f) for f in diff_frames]
-    gif_path = "diff_evolution.gif"
-    frames[0].save(
-        gif_path,
-        format="GIF",
-        save_all=True,
-        append_images=frames[1:],
-        duration=750,   # ms per frame
-        loop=0          # 0 = infinite loop
-    )  
+    # frames = [Image.open(f) for f in diff_frames]
+    # gif_path = "diff_evolution.gif"
+    # frames[0].save(
+    #     gif_path,
+    #     format="GIF",
+    #     save_all=True,
+    #     append_images=frames[1:],
+    #     duration=750,   # ms per frame
+    #     loop=0          # 0 = infinite loop
+    # )  
 
-    # upload the GIF as a W&B video
-    wandb.log({ "Diffs Evolution": wandb.Video(gif_path, format="gif") })
+    # # upload the GIF as a W&B video
+    # wandb.log({ "Diffs Evolution": wandb.Video(gif_path, format="gif") })
 
-    # clean up
-    for fn in diff_frames:
-        os.remove(fn)
-    os.remove(gif_path)
+    # # clean up
+    # for fn in diff_frames:
+    #     os.remove(fn)
+    # os.remove(gif_path)
+
     # ── Finish W&B run ───────────────────────────────────────
     wandb.finish()

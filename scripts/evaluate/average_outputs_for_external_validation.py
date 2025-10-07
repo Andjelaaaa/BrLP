@@ -4,7 +4,8 @@ import numpy as np
 from pathlib import Path
 from collections import defaultdict
 
-ROOT = Path("/home/andim/scratch/brlp/predict-cond-decoder-imgs/external")  # has fold_1..fold_5
+# ROOT = Path("/home/andim/scratch/brlp/predict-cond-decoder-imgs/external")  # has fold_1..fold_5
+ROOT = Path("/home/andim/scratch/brlp/predict-cond-decoder-imgs/external_native_space")
 OUT  = ROOT / "ensemble"
 OUT.mkdir(parents=True, exist_ok=True)
 
