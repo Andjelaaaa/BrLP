@@ -553,31 +553,31 @@ if __name__ == "__main__":
         out_seg  = os.path.join(args.out_dir, f"{sid}_{T1}_{T2}_T2pred_seg.nii.gz")
         pred_seg_pairs.append((pred_nii, out_seg))
 
-    in_list  = os.path.join(args.out_dir, "temp-input.txt")
-    out_list = os.path.join(args.out_dir, "temp-output.txt")
+    # in_list  = os.path.join(args.out_dir, "temp-input.txt")
+    # out_list = os.path.join(args.out_dir, "temp-output.txt")
 
-    # write the lists
-    with open(in_list, "w") as f_in, open(out_list, "w") as f_out:
-        for pred, seg in pred_seg_pairs:
-            f_in.write(f"{pred}\n")
-            f_out.write(f"{seg}\n")
+    # # write the lists
+    # with open(in_list, "w") as f_in, open(out_list, "w") as f_out:
+    #     for pred, seg in pred_seg_pairs:
+    #         f_in.write(f"{pred}\n")
+    #         f_out.write(f"{seg}\n")
 
-    # choose threads sensibly (e.g., SLURM_CPUS_PER_TASK or fallback)
-    threads = str(int(os.getenv("SLURM_CPUS_PER_TASK", "8")))
+    # # choose threads sensibly (e.g., SLURM_CPUS_PER_TASK or fallback)
+    # threads = str(int(os.getenv("SLURM_CPUS_PER_TASK", "8")))
 
-    # run SynthSeg, pointing to the full paths
-    try:
-        subprocess.run(
-            ["mri_synthseg", "--i", in_list, "--o", out_list, "--threads", threads, "--cpu"],
-            check=True,
-        )
-    finally:
-        # always try to clean up
-        for p in (in_list, out_list):
-            try:
-                os.remove(p)
-            except FileNotFoundError:
-                pass
+    # # run SynthSeg, pointing to the full paths
+    # try:
+    #     subprocess.run(
+    #         ["mri_synthseg", "--i", in_list, "--o", out_list, "--threads", threads, "--cpu"],
+    #         check=True,
+    #     )
+    # finally:
+    #     # always try to clean up
+    #     for p in (in_list, out_list):
+    #         try:
+    #             os.remove(p)
+    #         except FileNotFoundError:
+    #             pass
 
     # 5) now load them all back, compute dice + gif logs
     results = []

@@ -1,6 +1,7 @@
 import os
 import argparse
 import math
+import subprocess
 import warnings
 from datetime import datetime
 import pandas as pd
@@ -41,7 +42,7 @@ from collections import defaultdict, Counter
 from torch.utils.data import Sampler
 import time
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,garbage_collection_threshold:0.6,expandable_segments:True"
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,garbage_collection_threshold:0.6,expandable_segments:True"
 
 def t(): return time.perf_counter()
 
@@ -151,35 +152,50 @@ def encode_mu_grad_chunked(
     ae,
     x,                          # [B, C, D, H, W]
     batch_chunk: int = 1,       # split the batch into micro-batches
-    segs: int = 4,              # split the encoder into N segments
-    use_reentrant: bool = False,# needs PyTorch >= 2.0 for checkpoint_sequential kw
-    amp: bool = True,           # run AE in autocast
+    segs: int = 4,              # desired #segments for encoder
+    use_reentrant: bool = False,
+    amp: bool = True,
 ):
     """
     Memory-reduced encode that keeps grad w.r.t. x.
     1) Splits batch into micro-chunks
-    2) Runs ae.encoder via checkpoint_sequential over 'segs' segments
+    2) Optionally runs ae.encoder via checkpoint_sequential over 'segs' segments
     3) Applies ae.quant_conv and returns mu (drops logvar)
     """
     outs = []
+
+    # Turn ae.encoder into a sequence for checkpoint_sequential
+    enc_children = list(ae.encoder.children())  # top-level, safe to use
+    n_funcs = len(enc_children)
+
+    # Safe segment count
+    if segs is None or segs < 1:
+        segs_eff = 1
+    else:
+        segs_eff = min(segs, max(1, n_funcs))
+        if segs_eff != segs:
+            warnings.warn(f"[encode_mu_grad_chunked] Clamping segs from {segs} to {segs_eff} (encoder has {n_funcs} children).")
+
+    # Build a Sequential only if we will actually segment
+    seq = nn.Sequential(*enc_children) if (n_funcs > 0 and segs_eff > 1) else None
+
     B = x.size(0)
-
-    # Turn ae.encoder into a list of modules for checkpoint_sequential
-    enc_modules = list(ae.encoder.children())  # assumes nn.Sequential-like
-    # If your encoder isn't sequential, you can manually define a list of “stage” modules.
-
     for i in range(0, B, batch_chunk):
         xi = x[i:i+batch_chunk]
 
-        with torch.cuda.amp.autocast(enabled=amp):
-            # segmented forward with checkpointing
-            h = checkpoint_sequential(
-                enc_modules, segs, xi, use_reentrant=use_reentrant
-            )
-            moments = ae.quant_conv(h)
-            mu, _logvar = torch.chunk(moments, 2, dim=1)
+        with autocast(enabled=amp):
+            if seq is not None:
+                # segmented forward of the encoder body
+                h = checkpoint_sequential(seq, segs_eff, xi, use_reentrant=use_reentrant)
+                # finish encode path manually
+                moments = ae.quant_conv(h)
+                mu, _logvar = torch.chunk(moments, 2, dim=1)
+            else:
+                # fallback: no segmentation (also covers non-sequential encoders)
+                mu, _logvar = ae.encode(xi)
 
         outs.append(mu)
+        del xi, mu
 
     return torch.cat(outs, dim=0)
 
@@ -739,6 +755,16 @@ def within_subject_latent_loss(
     den  = (w   *     mask).sum().clamp_min(eps)
     return num / den
 
+def global_channel_feat(mu: torch.Tensor) -> torch.Tensor:
+    """
+    Turns mu into [B, D] by averaging over all spatial dims (if any).
+    Works for mu shaped [B,C,D,H,W] (3D), [B,C,H,W] (2D), [B,C,L] (1D), or [B,D] (flat already).
+    """
+    assert mu.dim() >= 2, f"mu must be at least [B, C], got {mu.shape}"
+    if mu.dim() == 2:
+        return mu  # already [B, D]
+    reduce_dims = tuple(range(2, mu.dim()))  # all dims after channel
+    return mu.mean(dim=reduce_dims)
 
 if __name__ == '__main__':
 
@@ -763,6 +789,16 @@ if __name__ == '__main__':
 
     set_determinism(0)
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f'The device is:', DEVICE)
+    print("CUDA visible:", torch.cuda.is_available())
+    print("CUDA_VISIBLE_DEVICES =", os.environ.get("CUDA_VISIBLE_DEVICES"))
+    print("torch.version.cuda =", torch.version.cuda)
+    print("torch.__version__   =", torch.__version__)
+    try:
+        out = subprocess.check_output(["nvidia-smi", "-L"]).decode()
+        print("nvidia-smi -L:\n", out)
+    except Exception as e:
+        print("nvidia-smi not runnable:", e)
 
     run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
 
@@ -958,9 +994,6 @@ if __name__ == '__main__':
                 ).view(x1_small.size(0), -1)
                 # z_pred = encode_mu_grad_chunked(autoencoder, x1_pred).view(x1_pred.size(0), -1)
 
-                # batch-level within-subject loss from same subject
-                l_within = within_subject_latent_loss(z_pred, age1.squeeze(1), subject_id, sigma=0.1)
-
                 # Discriminator on fake → generator adv‐loss
                 logits_fake = discriminator(x1_pred.contiguous().float())[-1]
                 gen_adv_loss = adv_weight * adv_loss_fn(
@@ -976,11 +1009,21 @@ if __name__ == '__main__':
                 # We skip KLD since encoder is frozen
                 # kld_loss = torch.tensor(0.0).to(DEVICE)
 
-                loss_g = rec_loss + gen_adv_loss + perc_loss + within_weight * l_within
+                
                 with torch.no_grad():
                     # z0     = enc_mu(autoencoder, img0).view(img0.size(0), -1)
-                    x0_small = F.avg_pool3d(_to_plain(img0), 2, 2)
-                    z0       = enc_mu_nograd(autoencoder, x0_small).view(x0_small.size(0), -1)
+                    x0_small = F.avg_pool3d(_to_plain(img0), 4, 4)
+                    z0       = enc_mu_nograd(autoencoder, x0_small)
+
+                # flatten BOTH to [B, Dflat]
+                z_pred_feat = z_pred.view(z_pred.size(0), -1)
+                z0_feat     = z0.view(z0.size(0), -1)
+
+                if step == 0 and epoch == 0:
+                    print("x1_small:", tuple(x1_small.shape))
+                    print("z_pred_mu:", tuple(z_pred.shape))
+                    print("z0_mu:", tuple(z0.shape))
+                    print("z_pred_feat:", tuple(z_pred_feat.shape))
 
                 # ages in months
                 age0_m = norm_to_months(age0)           # [B,1]
@@ -993,8 +1036,12 @@ if __name__ == '__main__':
                 )
 
                 # apply weight per-sample
-                l_id_lat_per = (z_pred - z0).pow(2).mean(dim=1, keepdim=True)   # [B,1]
+                l_id_lat_per = (z_pred_feat - z0_feat).pow(2).mean(dim=1, keepdim=True)   # [B,1]
                 l_id_lat     = (w_id * l_id_lat_per).mean()
+
+                # batch-level within-subject loss from same subject
+                l_within = within_subject_latent_loss(z_pred_feat, age1.squeeze(1), subject_id, sigma=0.1)
+                loss_g = rec_loss + gen_adv_loss + perc_loss + within_weight * l_within
 
                 # ----- per-batch scalars to log -----
                 w_id_mean     = w_id.mean()                       # scalar
