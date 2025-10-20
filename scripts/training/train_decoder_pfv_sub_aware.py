@@ -698,6 +698,87 @@ class LongitudinalMRIDataset(Dataset):
 
         return img0, age0, img1, age1, subject_id
 
+def sigma_by_pair_age_months(a_pair_m: torch.Tensor,
+                             cut1=24.0, cut2=48.0,
+                             sig_young=6.0, sig_mid=9.0, sig_old=12.0):
+    """
+    Piecewise sigma(age): smaller for young (↓weight on close ages),
+    larger for older (↑consistency).
+    a_pair_m: [B,B] months (e.g., min or mean age of the pair)
+    returns:  [B,B] months
+    """
+    dev, dt = a_pair_m.device, a_pair_m.dtype
+    s_y = torch.tensor(sig_young, device=dev, dtype=dt)
+    s_m = torch.tensor(sig_mid,   device=dev, dtype=dt)
+    s_o = torch.tensor(sig_old,   device=dev, dtype=dt)
+    return torch.where(
+        a_pair_m < cut1, s_y,
+        torch.where(a_pair_m < cut2, s_m, s_o)
+    )
+
+def within_subject_latent_loss_ageaware(
+    z_pred: torch.Tensor,        # [B, D]
+    age_norm: torch.Tensor,      # [B] or [B,1] in [0,1]
+    subject_id,                  # list[str] or LongTensor [B]
+    # age→sigma schedule (months):
+    cut1=24.0, cut2=48.0,
+    sig_young=6.0, sig_mid=9.0, sig_old=12.0,
+    eps: float = 1e-8
+) -> torch.Tensor:
+    """
+    L = sum_{i<j, same subj} w_ij * MSE(z_i,z_j) / sum w_ij,
+    with w_ij = exp(- |Δage_months| / sigma(age_pair_months))
+
+    For 'age_pair_months' we use min(age_i, age_j): if either point is very young,
+    allow more change (smaller sigma → smaller weight).
+    """
+    dev = z_pred.device
+    B   = z_pred.size(0)
+
+    # ages → [B] months
+    if age_norm.dim() == 2 and age_norm.size(1) == 1:
+        age_norm = age_norm.view(-1)
+    age_m = norm_to_months(age_norm.to(dev))  # [B]
+
+    # subject ids → LongTensor [B]
+    if isinstance(subject_id, (list, tuple)):
+        sids = list(map(str, subject_id))
+        uniq = {s: i for i, s in enumerate(dict.fromkeys(sids))}
+        subj = torch.tensor([uniq[s] for s in sids], dtype=torch.long, device=dev)
+    elif isinstance(subject_id, torch.Tensor):
+        subj = subject_id.to(dev).long()
+    else:
+        raise TypeError("subject_id must be list/tuple[str] or Tensor")
+
+    # masks for same-subject pairs, upper triangle (no double count)
+    same = subj.unsqueeze(0).eq(subj.unsqueeze(1))           # [B,B]
+    tri  = torch.triu(torch.ones(B, B, dtype=torch.bool, device=dev), diagonal=1)
+    mask = same & tri
+    if not mask.any():
+        return z_pred.new_zeros([])
+
+    # pairwise MSE in latent
+    diff = z_pred.unsqueeze(1) - z_pred.unsqueeze(0)         # [B,B,D]
+    mse  = (diff * diff).mean(dim=-1)                        # [B,B]
+
+    # age matrices (months)
+    ai = age_m.unsqueeze(0)                                   # [1,B]
+    aj = age_m.unsqueeze(1)                                   # [B,1]
+    d_months = (ai - aj).abs()                                # [B,B]
+    a_pair   = torch.minimum(ai, aj)                          # [B,B]  (use min-age in the pair)
+
+    # sigma(age_pair) in months
+    sigma_m = sigma_by_pair_age_months(a_pair, cut1, cut2, sig_young, sig_mid, sig_old)
+
+    # weights
+    w = torch.exp(- d_months / sigma_m.clamp_min(1e-6))       # [B,B]
+
+    # weighted average over masked pairs
+    num = (mse * w * mask).sum()
+    den = (w   *     mask).sum().clamp_min(eps)
+    return num / den
+
+
 def within_subject_latent_loss(
     z_pred: torch.Tensor,          # [B, D] latent/features with grad
     age: torch.Tensor,             # [B] or [B,1] ages (same units as sigma)
@@ -907,7 +988,10 @@ if __name__ == '__main__':
     # Preserves higher-level structures and textures beyond raw pixels.
     # Reduce if training is slow or unstable.
 
-    within_weight = 0.1
+    within_weight = 0.2
+    # within_weight_start = 0.05
+    # within_weight_end   = 0.5  
+    # ramp_epochs         = 10
     # Within-subject latent consistency. For pairs from the same subject,
     # pulls predicted latents closer, with stronger pull when Δage is small.
     # Improves subject-specific temporal coherence.
@@ -986,13 +1070,10 @@ if __name__ == '__main__':
             with autocast(enabled=True):
                 x1_pred = model(img0, age0, age1)  
 
-                # x1_small = F.avg_pool3d(_to_plain(x1_pred), 4, 4)
-                # z_pred   = encode_mu_grad_chunked(autoencoder, x1_small, chunk=2, use_reentrant=False).view(x1_small.size(0), -1)
                 x1_small = F.avg_pool3d(_to_plain(x1_pred), 4, 4)  # stronger pooling to shrink graph
                 z_pred   = encode_mu_grad_chunked(
                     autoencoder, x1_small, batch_chunk=2, segs=6, use_reentrant=False, amp=True
-                ).view(x1_small.size(0), -1)
-                # z_pred = encode_mu_grad_chunked(autoencoder, x1_pred).view(x1_pred.size(0), -1)
+                ).view(x1_pred.size(0), -1)
 
                 # Discriminator on fake → generator adv‐loss
                 logits_fake = discriminator(x1_pred.contiguous().float())[-1]
@@ -1021,44 +1102,48 @@ if __name__ == '__main__':
 
                 if step == 0 and epoch == 0:
                     print("x1_small:", tuple(x1_small.shape))
+                    # print("x1_pred:", tuple(x1_pred.shape))
                     print("z_pred_mu:", tuple(z_pred.shape))
                     print("z0_mu:", tuple(z0.shape))
                     print("z_pred_feat:", tuple(z_pred_feat.shape))
 
-                # ages in months
-                age0_m = norm_to_months(age0)           # [B,1]
-                age1_m = norm_to_months(age1)           # [B,1]
-                d_m     = (age1_m - age0_m).abs()       # [B,1]  Δmonths
-
-                w_id = small_step_weight_months(
-                    age0, age1, tau_mode="smooth",
-                    pivot=36.0, steep=0.12, tau_young_s=9.0, tau_old_s=3.0
-                )
-
-                # apply weight per-sample
-                l_id_lat_per = (z_pred_feat - z0_feat).pow(2).mean(dim=1, keepdim=True)   # [B,1]
-                l_id_lat     = (w_id * l_id_lat_per).mean()
-
                 # batch-level within-subject loss from same subject
                 l_within = within_subject_latent_loss(z_pred_feat, age1.squeeze(1), subject_id, sigma=0.1)
                 loss_g = rec_loss + gen_adv_loss + perc_loss + within_weight * l_within
+                # l_within = within_subject_latent_loss_ageaware(z_pred_feat, age1.squeeze(1), subject_id)
+                # within_weight = within_weight_start + (within_weight_end - within_weight_start) * min(epoch / ramp_epochs, 1.0)
+                # loss_g = rec_loss + gen_adv_loss + perc_loss + within_weight * l_within
 
-                # ----- per-batch scalars to log -----
-                w_id_mean     = w_id.mean()                       # scalar
-                d_m_mean      = d_m.mean()                        # scalar
-                id_contrib    = lambda_id * l_id_lat              # scalar (regularizer's contribution)
+                # # ages in months
+                # age0_m = norm_to_months(age0)           # [B,1]
+                # age1_m = norm_to_months(age1)           # [B,1]
+                # d_m     = (age1_m - age0_m).abs()       # [B,1]  Δmonths
 
-                # age-bin masks (12–24, 24–48, 48–84 months)
-                b12_24 = (age0_m >= 12.0) & (age0_m < 24.0)
-                b24_48 = (age0_m >= 24.0) & (age0_m < 48.0)
-                b48_84 = (age0_m >= 48.0) & (age0_m <= 84.0)
+                # w_id = small_step_weight_months(
+                #     age0, age1, tau_mode="smooth",
+                #     pivot=36.0, steep=0.12, tau_young_s=9.0, tau_old_s=3.0
+                # )
 
-                # mean w_id per bin (may be NaN if no samples fall in a bin for this batch)
-                w12_24 = masked_mean(w_id.view(-1), b12_24.view(-1))
-                w24_48 = masked_mean(w_id.view(-1), b24_48.view(-1))
-                w48_84 = masked_mean(w_id.view(-1), b48_84.view(-1))
+                # # apply weight per-sample
+                # l_id_lat_per = (z_pred_feat - z0_feat).pow(2).mean(dim=1, keepdim=True)   # [B,1]
+                # l_id_lat     = (w_id * l_id_lat_per).mean()
 
-                loss_g = loss_g + lambda_id * l_id_lat
+                # # ----- per-batch scalars to log -----
+                # w_id_mean     = w_id.mean()                       # scalar
+                # d_m_mean      = d_m.mean()                        # scalar
+                # id_contrib    = lambda_id * l_id_lat              # scalar (regularizer's contribution)
+
+                # # age-bin masks (12–24, 24–48, 48–84 months)
+                # b12_24 = (age0_m >= 12.0) & (age0_m < 24.0)
+                # b24_48 = (age0_m >= 24.0) & (age0_m < 48.0)
+                # b48_84 = (age0_m >= 48.0) & (age0_m <= 84.0)
+
+                # # mean w_id per bin (may be NaN if no samples fall in a bin for this batch)
+                # w12_24 = masked_mean(w_id.view(-1), b12_24.view(-1))
+                # w24_48 = masked_mean(w_id.view(-1), b24_48.view(-1))
+                # w48_84 = masked_mean(w_id.view(-1), b48_84.view(-1))
+
+                # loss_g = loss_g + lambda_id * l_id_lat
 
             # ---- free big intermediates BEFORE backward ----
             del x1_small, logits_fake
@@ -1088,12 +1173,12 @@ if __name__ == '__main__':
             # avgloss.put('Generator/two_view',   (two_view_weight * l_two_view).item())
             avgloss.put('Generator/total',      loss_g.item())
             avgloss.put('Discriminator/loss', loss_d.item())
-            avgloss.put('RegID/w_id_mean',         w_id_mean.item())
-            avgloss.put('RegID/w_id_12_24',        w12_24.item())
-            avgloss.put('RegID/w_id_24_48',        w24_48.item())
-            avgloss.put('RegID/w_id_48_84',        w48_84.item())
-            avgloss.put('RegID/dmonths_mean',      d_m_mean.item())
-            avgloss.put('RegID/id_contrib',        id_contrib.item())
+            # avgloss.put('RegID/w_id_mean',         w_id_mean.item())
+            # avgloss.put('RegID/w_id_12_24',        w12_24.item())
+            # avgloss.put('RegID/w_id_24_48',        w24_48.item())
+            # avgloss.put('RegID/w_id_48_84',        w48_84.item())
+            # avgloss.put('RegID/dmonths_mean',      d_m_mean.item())
+            # avgloss.put('RegID/id_contrib',        id_contrib.item())
 
             if (step % 50) == 0: torch.cuda.empty_cache()
 
@@ -1107,29 +1192,29 @@ if __name__ == '__main__':
                     "g_total": f"{loss_g.item():.4f}",
                     "d": f"{loss_d.item():.4f}",
                 })
-            if total_counter % 50 == 0:
-                it = total_counter 
+            # if total_counter % 50 == 0:
+            #     it = total_counter 
 
-                # flatten, sanitize, and move to numpy
-                w_np = w_id.detach().float().view(-1)
-                d_np = d_m.detach().float().view(-1)
+            #     # flatten, sanitize, and move to numpy
+            #     w_np = w_id.detach().float().view(-1)
+            #     d_np = d_m.detach().float().view(-1)
 
-                # remove non-finite just in case
-                w_np = w_np[torch.isfinite(w_np)]
-                d_np = d_np[torch.isfinite(d_np)]
+            #     # remove non-finite just in case
+            #     w_np = w_np[torch.isfinite(w_np)]
+            #     d_np = d_np[torch.isfinite(d_np)]
 
-                w_np = w_np.cpu().numpy()
-                d_np = d_np.cpu().numpy()
+            #     w_np = w_np.cpu().numpy()
+            #     d_np = d_np.cpu().numpy()
 
-                wandb.log({
-                    "hist/w_id": wandb.Histogram(w_np, num_bins=30),
-                    "hist/d_months": wandb.Histogram(d_np, num_bins=30),
-                    # handy scalars
-                    "stat/w_id_mean": float(w_np.mean()) if w_np.size else 0.0,
-                    "stat/w_id_min":  float(w_np.min())  if w_np.size else 0.0,
-                    "stat/w_id_max":  float(w_np.max())  if w_np.size else 0.0,
-                    "stat/dm_mean":   float(d_np.mean()) if d_np.size else 0.0,
-                }, step=it)
+            #     wandb.log({
+            #         "hist/w_id": wandb.Histogram(w_np, num_bins=30),
+            #         "hist/d_months": wandb.Histogram(d_np, num_bins=30),
+            #         # handy scalars
+            #         "stat/w_id_mean": float(w_np.mean()) if w_np.size else 0.0,
+            #         "stat/w_id_min":  float(w_np.min())  if w_np.size else 0.0,
+            #         "stat/w_id_max":  float(w_np.max())  if w_np.size else 0.0,
+            #         "stat/dm_mean":   float(d_np.mean()) if d_np.size else 0.0,
+            #     }, step=it)
 
             if total_counter % 10 == 0:
                 it = total_counter #// 10
@@ -1142,12 +1227,12 @@ if __name__ == '__main__':
                     # 'train/gen/two_view':  avgloss.pop_avg('Generator/two_view'),
                     'train/gen/total':     avgloss.pop_avg('Generator/total'),
                     'train/disc/loss': avgloss.pop_avg('Discriminator/loss'),
-                    'train/regid/w_id_mean':    avgloss.pop_avg('RegID/w_id_mean'),
-                    'train/regid/w_id_12_24':   avgloss.pop_avg('RegID/w_id_12_24'),
-                    'train/regid/w_id_24_48':   avgloss.pop_avg('RegID/w_id_24_48'),
-                    'train/regid/w_id_48_84':   avgloss.pop_avg('RegID/w_id_48_84'),
-                    'train/regid/dmonths_mean': avgloss.pop_avg('RegID/dmonths_mean'),
-                    'train/regid/id_contrib':   avgloss.pop_avg('RegID/id_contrib'),
+                    # 'train/regid/w_id_mean':    avgloss.pop_avg('RegID/w_id_mean'),
+                    # 'train/regid/w_id_12_24':   avgloss.pop_avg('RegID/w_id_12_24'),
+                    # 'train/regid/w_id_24_48':   avgloss.pop_avg('RegID/w_id_24_48'),
+                    # 'train/regid/w_id_48_84':   avgloss.pop_avg('RegID/w_id_48_84'),
+                    # 'train/regid/dmonths_mean': avgloss.pop_avg('RegID/dmonths_mean'),
+                    # 'train/regid/id_contrib':   avgloss.pop_avg('RegID/id_contrib'),
                     'step': it,
                     'epoch': epoch
                 }
