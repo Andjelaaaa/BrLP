@@ -119,10 +119,10 @@ train_aug = Compose([
                 translate_range=(1,1,1), scale_range=(0.02,0.02,0.02), mode='bilinear')
 ])
 
-# # @torch.no_grad()
-# def enc_mu(enc, x):                     # use mean, not a stochastic sample
-#     mu, _ = enc.encode(x)
-#     return mu
+# @torch.no_grad()
+def enc_mu(enc, x):                     # use mean, not a stochastic sample
+    mu, _ = enc.encode(x)
+    return mu
 
 # # --- grad-enabled, chunked encoder forward (no checkpoint needed) ---
 # def encode_mu_grad_chunked(ae, x, chunk=1):
@@ -887,23 +887,23 @@ if __name__ == '__main__':
     diff_frames = []
 
     # Initialize WandB
-    wandb.init(
-        project=args.project,
-        name=run_name,
-        mode="offline",
-        config={
-            "dataset_csv": args.dataset_csv,
-            "aekl_ckpt": args.aekl_ckpt,
-            "disc_ckpt": args.disc_ckpt,
-            "n_epochs": args.n_epochs,
-            "max_batch_size": args.max_batch_size,
-            "batch_size": args.batch_size,
-            "lr": args.lr,
-            "resolution": const.RESOLUTION,
-            "input_shape": const.INPUT_SHAPE_AE,
-            "fold_test": args.fold_test
-        }
-    )
+    run = wandb.init(
+            project=args.project,
+            name=run_name,
+            mode="offline",
+            config={
+                "dataset_csv": args.dataset_csv,
+                "aekl_ckpt": args.aekl_ckpt,
+                "disc_ckpt": args.disc_ckpt,
+                "n_epochs": args.n_epochs,
+                "max_batch_size": args.max_batch_size,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+                "resolution": const.RESOLUTION,
+                "input_shape": const.INPUT_SHAPE_AE,
+                "fold_test": args.fold_test
+            }
+        )
     config = wandb.config
 
     # ─── Build train/val splits ────────────────────────────────────
@@ -1009,6 +1009,17 @@ if __name__ == '__main__':
 
     # Total G loss ≈ L1 (reconstruction) + adv_weight·GAN + perceptual_weight·perceptual + within_weight·within-subject + two_view_weight·two-view + lambda_id·age-aware-identity
 
+    loss_weights = {
+    "adv_weight": adv_weight,
+    "perceptual_weight": perceptual_weight,
+    "within_weight": within_weight,
+    }
+
+    run.config.update(
+    {f"loss_weights/{k}": v for k, v in loss_weights.items()},
+    allow_val_change=True
+    )
+
     kl_loss_fn  = KLDivergenceLoss()
     adv_loss_fn = PatchAdversarialLoss(criterion="least_squares")
     with warnings.catch_warnings():
@@ -1070,10 +1081,11 @@ if __name__ == '__main__':
             with autocast(enabled=True):
                 x1_pred = model(img0, age0, age1)  
 
-                x1_small = F.avg_pool3d(_to_plain(x1_pred), 4, 4)  # stronger pooling to shrink graph
-                z_pred   = encode_mu_grad_chunked(
-                    autoencoder, x1_small, batch_chunk=2, segs=6, use_reentrant=False, amp=True
-                ).view(x1_pred.size(0), -1)
+                # x1_small = F.avg_pool3d(_to_plain(x1_pred), 4, 4)  # stronger pooling to shrink graph
+                # z_pred   = encode_mu_grad_chunked(
+                #     autoencoder, x1_small, batch_chunk=2, segs=6, use_reentrant=False, amp=True
+                # ).view(x1_pred.size(0), -1)
+                z_pred = enc_mu_ckpt(autoencoder, x1_pred).view(x1_pred.size(0), -1)
 
                 # Discriminator on fake → generator adv‐loss
                 logits_fake = discriminator(x1_pred.contiguous().float())[-1]
@@ -1092,23 +1104,25 @@ if __name__ == '__main__':
 
                 
                 with torch.no_grad():
-                    # z0     = enc_mu(autoencoder, img0).view(img0.size(0), -1)
-                    x0_small = F.avg_pool3d(_to_plain(img0), 4, 4)
-                    z0       = enc_mu_nograd(autoencoder, x0_small)
+                    z0     = enc_mu(autoencoder, img0).view(img0.size(0), -1)
+                    # x0_small = F.avg_pool3d(_to_plain(img0), 4, 4)
+                    # z0       = enc_mu_nograd(autoencoder, x0_small)
 
                 # flatten BOTH to [B, Dflat]
-                z_pred_feat = z_pred.view(z_pred.size(0), -1)
-                z0_feat     = z0.view(z0.size(0), -1)
+                # z_pred_feat = z_pred.view(z_pred.size(0), -1)
+                # z0_feat     = z0.view(z0.size(0), -1)
 
                 if step == 0 and epoch == 0:
-                    print("x1_small:", tuple(x1_small.shape))
-                    # print("x1_pred:", tuple(x1_pred.shape))
-                    print("z_pred_mu:", tuple(z_pred.shape))
-                    print("z0_mu:", tuple(z0.shape))
-                    print("z_pred_feat:", tuple(z_pred_feat.shape))
+                    # print("x1_small:", tuple(x1_small.shape))
+                    print("x1_pred:", tuple(x1_pred.shape))
+                    # print("z_pred_mu:", tuple(z_pred.shape))
+                    # print("z0_mu:", tuple(z0.shape))
+                    print("z0:", tuple(z0.shape))
+                    # print("z_pred_feat:", tuple(z_pred_feat.shape))
+                    print("z_pred:", tuple(z_pred.shape))
 
                 # batch-level within-subject loss from same subject
-                l_within = within_subject_latent_loss(z_pred_feat, age1.squeeze(1), subject_id, sigma=0.1)
+                l_within = within_subject_latent_loss(z_pred, age1.squeeze(1), subject_id, sigma=0.1)
                 loss_g = rec_loss + gen_adv_loss + perc_loss + within_weight * l_within
                 # l_within = within_subject_latent_loss_ageaware(z_pred_feat, age1.squeeze(1), subject_id)
                 # within_weight = within_weight_start + (within_weight_end - within_weight_start) * min(epoch / ramp_epochs, 1.0)
@@ -1146,7 +1160,7 @@ if __name__ == '__main__':
                 # loss_g = loss_g + lambda_id * l_id_lat
 
             # ---- free big intermediates BEFORE backward ----
-            del x1_small, logits_fake
+            # del x1_small, logits_fake
             torch.cuda.empty_cache()
             gradacc_g.step(loss_g, step)
 
@@ -1385,4 +1399,4 @@ if __name__ == '__main__':
     # os.remove(gif_path)
 
     # ── Finish W&B run ───────────────────────────────────────
-    wandb.finish()
+    run.finish()
