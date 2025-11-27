@@ -3,6 +3,7 @@ import argparse
 import warnings
 import wandb
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 from collections import defaultdict
 import torch
@@ -182,8 +183,8 @@ if __name__ == '__main__':
     parser.add_argument('--adv_weight',         default=0.025, type=float)
     parser.add_argument('--perceptual_weight',  default=0.001, type=float)
     parser.add_argument('--aug_p',          default=0.8,   type=float)
-    parser.add_argument('--fold_test',      required=True,  type=int,
-                        help="Which fold (1-5) to hold out as test")
+    parser.add_argument('--fold',      required=True,  type=int,
+                        help="Which fold for training")
     args = parser.parse_args()
 
     run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
@@ -192,7 +193,7 @@ if __name__ == '__main__':
     project="ae-training-folds",
     config=vars(args),      # logs all CLI args as hyperparameters
     mode="online",         # records locally; you can later `wandb sync`
-    name=f"{run_name}_foldtest{args.fold_test}",
+    name=f"{run_name}_fold{args.fold}",
     dir=args.output_dir     # where to write the wandb files
     )
 
@@ -206,9 +207,9 @@ if __name__ == '__main__':
     ])
 
     # pick your test‐fold from the CLI
-    fold = args.fold_test
+    fold = args.fold
     if fold not in range(1,6):
-        raise ValueError(f"fold_test must be 1..5, got {fold}")
+        raise ValueError(f"fold must be 1..5, got {fold}")
 
     print(f"\n\n=== Training on fold {fold}")
 
@@ -270,6 +271,9 @@ if __name__ == '__main__':
     total_counter = 0
     best = {"epoch": -1, "score": float("inf"), "ssim": -float("inf")}
 
+    
+    wandb.define_metric("Val/*", step_metric="epoch")
+    wandb.define_metric("Train/*", step_metric="total_counter")  # if you log that too
 
     for epoch in range(args.n_epochs):
         
@@ -325,11 +329,11 @@ if __name__ == '__main__':
             gradacc_d.step(loss_d, step)
 
             # Logging.
-            avgloss.put('Generator/reconstruction_loss',    rec_loss.item())
-            avgloss.put('Generator/perceptual_loss',        per_loss.item())
-            avgloss.put('Generator/adverarial_loss',        gen_loss.item())
-            avgloss.put('Generator/kl_regularization',      kld_loss.item())
-            avgloss.put('Discriminator/adverarial_loss',    loss_d.item())
+            avgloss.put('Train/Generator/reconstruction_loss',    rec_loss.item())
+            avgloss.put('Train/Generator/perceptual_loss',        per_loss.item())
+            avgloss.put('Train/Generator/adverarial_loss',        gen_loss.item())
+            avgloss.put('Train/Generator/kl_regularization',      kld_loss.item())
+            avgloss.put('Train/Discriminator/adverarial_loss',    loss_d.item())
 
             if total_counter % 10 == 0:
                 step = total_counter
@@ -345,7 +349,7 @@ if __name__ == '__main__':
         )
 
         # log at epoch granularity (or use your global step)
-        wandb.log(val_metrics, step=epoch)
+        wandb.log({**val_metrics, "epoch": epoch})
 
         print(f"[epoch {epoch}] " +
             " | ".join([f"{k}={v:.4g}" for k, v in val_metrics.items()]))
