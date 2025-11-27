@@ -1,6 +1,8 @@
 import os
 import argparse
 import math
+import json
+import shutil
 import subprocess
 import warnings
 from datetime import datetime
@@ -12,6 +14,8 @@ import torch
 import torch.nn as nn
 from torch.nn import L1Loss
 import copy
+from collections import deque
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
 import torch.nn.functional as F
@@ -571,6 +575,106 @@ class AgeEmbedMLP(nn.Module):
     def forward(self, age_vec):  # [B, in_dim]
         return self.mlp(age_vec)
 
+class AgeConditionalDecoderFiLM(nn.Module):
+    """
+    Age-conditional decoder that modulates the latent volume channel-wise
+    (FiLM-style) instead of flattening the whole latent and applying a huge
+    Linear(latent_flat + age_dim -> latent_flat).
+
+    Signature is kept the same as your previous version:
+      - __init__(pretrained_ae, age_embed_dim=16)
+      - forward(z, age0, age1) -> x_pred
+    """
+    def __init__(self, pretrained_ae: torch.nn.Module, age_embed_dim: int = 16):
+        super().__init__()
+        self.age_embed_dim = age_embed_dim
+
+        # Copy decoder pieces from the pretrained autoencoder
+        self.post_quant_conv = copy.deepcopy(pretrained_ae.post_quant_conv)
+        self.decoder_blocks  = copy.deepcopy(pretrained_ae.decoder.blocks)
+        self.decoder_body    = nn.Sequential(*self.decoder_blocks)
+
+        # Age embedding network (same as before)
+        self.age_mlp = AgeEmbedMLP(in_dim=3, age_embed_dim=age_embed_dim)
+
+        # --- FiLM-style conditioning setup -----------------------------------
+        # Infer number of latent channels after post_quant_conv
+        if hasattr(self.post_quant_conv, "out_channels"):
+            self.latent_channels = self.post_quant_conv.out_channels
+        else:
+            raise RuntimeError(
+                "post_quant_conv has no 'out_channels'; "
+                "please adapt AgeConditionalDecoder accordingly."
+            )
+
+        # Map age embedding -> [gamma, beta] per latent channel
+        self.age_to_gamma_beta = nn.Linear(
+            age_embed_dim,
+            2 * self.latent_channels
+        )
+        nn.init.xavier_uniform_(self.age_to_gamma_beta.weight)
+        nn.init.zeros_(self.age_to_gamma_beta.bias)
+
+        # ---------------------------------------------------------------------
+        # Backwards-compatibility: these existed in the old class but are no
+        # longer used. Keeping them avoids attribute errors if something touches
+        # them elsewhere.
+        self.cond_proj = None
+        self._proj_built = True
+        self.latent_flat = None
+
+    def initialize_projection(self, z_shape, device):
+        """
+        Backwards-compatibility no-op. In the old implementation this created
+        a huge Linear(latent_flat + age_dim -> latent_flat). We don't need it
+        anymore, but leaving the method so any external calls don't break.
+        """
+        B, C_lat, D_lat, H_lat, W_lat = z_shape
+        self.latent_flat = C_lat * D_lat * H_lat * W_lat
+        self._proj_built = True
+        # nothing else to do
+
+    def forward(self, z, age0, age1):
+        """
+        z:     [B, C_lat_in, D_lat, H_lat, W_lat] from the encoder
+        age0:  [B, 1] (baseline age)
+        age1:  [B, 1] (target / follow-up age)
+        """
+        # Make sure ages are [B, 1] and on same device/dtype as z
+        device = z.device
+        age0 = age0.to(device).float()
+        age1 = age1.to(device).float()
+
+        if age0.dim() == 1:
+            age0 = age0.unsqueeze(1)
+        if age1.dim() == 1:
+            age1 = age1.unsqueeze(1)
+
+        # Latent from AE
+        z_post = self.post_quant_conv(z)  # [B, C_lat, D, H, W]
+        B, C_lat, D_lat, H_lat, W_lat = z_post.shape
+
+        # Build age conditioning vector [age0, age1, d_age]
+        d_age = age1 - age0
+        age_vec = torch.cat([age0, age1, d_age], dim=1)  # [B, 3]
+
+        # Age embedding
+        age_emb = self.age_mlp(age_vec)                  # [B, age_embed_dim]
+
+        # Map age embedding -> FiLM parameters ([gamma, beta] per channel)
+        gamma_beta = self.age_to_gamma_beta(age_emb)     # [B, 2*C_lat]
+        gamma, beta = torch.chunk(gamma_beta, 2, dim=1)  # each [B, C_lat]
+
+        # Reshape for broadcasting over D, H, W
+        gamma = gamma.view(B, C_lat, 1, 1, 1)
+        beta  = beta.view(B, C_lat, 1, 1, 1)
+
+        # FiLM modulation (1 + gamma) * z + beta is common; keeps scale near 1
+        z_cond = (1.0 + gamma) * z_post + beta
+
+        # Decode to image space
+        x_pred = self.decoder_body(z_cond)
+        return x_pred
 class AgeConditionalDecoder(nn.Module):
     def __init__(self, pretrained_ae: torch.nn.Module, age_embed_dim=16):
         super().__init__()
@@ -847,6 +951,88 @@ def global_channel_feat(mu: torch.Tensor) -> torch.Tensor:
     reduce_dims = tuple(range(2, mu.dim()))  # all dims after channel
     return mu.mean(dim=reduce_dims)
 
+@torch.no_grad()
+def evaluate_one_epoch(model, discriminator, loader, device, l1_loss_fn, perc_loss_fn,
+                       adv_loss_fn, adv_weight, within_weight):
+    model.eval()
+    disc_eval_mode = True
+    if hasattr(discriminator, "training"):
+        discriminator.eval()
+
+    n = 0
+    sums = {
+        "rec": 0.0, "adv": 0.0, "perc": 0.0, "within": 0.0, "total": 0.0, "d": 0.0
+    }
+
+    for batch in loader:
+        img0, age0, img1, age1, subject_id = batch
+        img0 = img0.to(device); img1 = img1.to(device)
+        age0 = age0.to(device).float(); age1 = age1.to(device).float()
+
+        with autocast(enabled=True):
+            x1_pred = model(img0, age0, age1)
+
+            # generator-side components (no optimizer step)
+            logits_fake = discriminator(x1_pred.contiguous().float())[-1]
+            gen_adv_loss = adv_weight * adv_loss_fn(
+                logits_fake, target_is_real=True, for_discriminator=False
+            )
+            rec_loss  = l1_loss_fn(x1_pred.float(), img1.float())
+            perc_loss = perceptual_weight * perc_loss_fn(x1_pred.float(), img1.float())
+
+            # for within-subject, mirror train computation
+            z_pred = enc_mu_ckpt(autoencoder, x1_pred).view(x1_pred.size(0), -1)
+            z0     = enc_mu(autoencoder, img0).view(img0.size(0), -1)
+            l_within = within_subject_latent_loss(z_pred, age1.squeeze(1), subject_id, sigma=0.1)
+
+            loss_g = rec_loss + gen_adv_loss + perc_loss + within_weight * l_within
+
+            # discriminator eval loss (optional)
+            logits_fake_detach = discriminator(x1_pred.contiguous().detach())[-1]
+            d_loss_fake = adv_loss_fn(
+                logits_fake_detach, target_is_real=False, for_discriminator=True
+            )
+            logits_real = discriminator(img1.contiguous().detach())[-1]
+            d_loss_real = adv_loss_fn(
+                logits_real, target_is_real=True, for_discriminator=True
+            )
+            loss_d = adv_weight * 0.5 * (d_loss_fake + d_loss_real)
+
+        bsz = img0.size(0)
+        n += bsz
+        sums["rec"]    += bsz * rec_loss.item()
+        sums["adv"]    += bsz * gen_adv_loss.item()
+        sums["perc"]   += bsz * perc_loss.item()
+        sums["within"] += bsz * (within_weight * l_within).item()
+        sums["total"]  += bsz * loss_g.item()
+        sums["d"]      += bsz * loss_d.item()
+
+    means = {k: v / max(n, 1) for k, v in sums.items()}
+    return means
+
+def _oom_guard(e: Exception) -> bool:
+    s = str(e)
+    return ("CUDA out of memory" in s) or ("CUDA error: out of memory" in s)
+
+def ema_update(prev, x, alpha=0.3):
+    return x if prev is None else (alpha * x + (1 - alpha) * prev)
+
+def _is_better(curr, best, delta_abs=0.0, delta_rel=None):
+    if best is None:
+        return True
+    if delta_rel is not None:
+        return curr < best * (1.0 - float(delta_rel))  # relative improvement
+    return curr < (best - float(delta_abs))            # absolute improvement
+
+def _save_ckpt(path, cond_decoder, discriminator, extra=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    state = {
+        "cond_decoder": cond_decoder.state_dict(),
+        "discriminator": discriminator.state_dict(),
+        "extra": extra or {}
+    }
+    torch.save(state, path)
+
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
@@ -860,14 +1046,33 @@ if __name__ == '__main__':
     parser.add_argument('--max_batch_size', default=2,     type=int)
     parser.add_argument('--batch_size',     default=16,    type=int)
     parser.add_argument('--lr',             default=1e-4,  type=float)
+    parser.add_argument('--adv_weight',         default=0.025, type=float)
+    parser.add_argument('--perceptual_weight',  default=0.001, type=float)
+    parser.add_argument('--within_weight',      default=0.2,   type=float)
+    # parser.add_argument('--lambda_id',          default=0.02,  type=float)
     parser.add_argument('--project',        default="age_conditional_decoder_sub_aware", type=str,
                         help="W&B project name")
     parser.add_argument('--run_name',       default=None,   type=str,
                         help="W&B run name (if omitted, it puts the date and time the experiment was run)")
     parser.add_argument('--fold_test',      required=True,  type=int,
-                        help="Which fold (0–4) to hold out as test")
+                        help="Which fold (1-5) to hold out as test/validation")
+    parser.add_argument('--cfg_index', type=int, default=None)
+    # New arguments for final run
+    parser.add_argument('--early_stop_patience', type=int, default=30,
+                    help='Stop if no val improvement for this many epochs.')
+    parser.add_argument('--early_stop_delta', type=float, default=0.0,
+                        help='Minimum improvement in val/Generator/total to count as better.')
+    parser.add_argument('--min_epochs', type=int, default=50,
+                        help='Always run at least this many epochs before early stopping.')
+    # LR plateau scheduler knobs
+    parser.add_argument('--plateau_factor', type=float, default=0.5)
+    parser.add_argument('--plateau_patience', type=int, default=12)
+    parser.add_argument('--plateau_cooldown', type=int, default=6)
+    parser.add_argument('--plateau_max_reductions', type=int, default=3)
     args = parser.parse_args()
-
+    
+    for k in ["FOLD","MAX_BS","N_EPOCHS","AEKL_CKPT","OUT_DIR","DATASET_CSV"]:
+        print(f"[env] {k}={os.environ.get(k)}")
     set_determinism(0)
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f'The device is:', DEVICE)
@@ -881,6 +1086,36 @@ if __name__ == '__main__':
     except Exception as e:
         print("nvidia-smi not runnable:", e)
 
+    # # Was for hyperparameter tuning
+    # PRESETS = [
+    # {"batch_size": 15, "lr": 1.475009935486e-04, "adv_weight": 6.8428003108626e-03, "perceptual_weight": 2.561612827481e-04, "within_weight": 3.307838087794471e-01},  # best from Phase A
+    # {"batch_size": 24, "lr": 2.540715804655e-04, "adv_weight": 7.4648733301997e-03, "perceptual_weight": 1.632151835778e-04, "within_weight": 2.954558540607372e-01},
+    # {"batch_size": 27, "lr": 2.202755996125e-04, "adv_weight": 2.0592180085369e-03, "perceptual_weight": 2.0738168504407e-03, "within_weight": 7.53929431399544e-02},
+    # {"batch_size": 21, "lr": 4.503807230759e-04, "adv_weight": 5.2025075211449e-03, "perceptual_weight": 1.0454340005774e-03, "within_weight": 5.21789028698888e-02},
+    # {"batch_size": 30, "lr": 1.337361494675e-04, "adv_weight": 7.6414097311996e-03, "perceptual_weight": 5.36117870327e-04, "within_weight": 1.347447984828771e-01},
+    # {"batch_size": 27, "lr": 7.8173083152e-05, "adv_weight": 7.1472293234358e-03, "perceptual_weight": 2.4572343808981e-03, "within_weight": 1.136724974363818e-01},
+    # {"batch_size": 21, "lr": 1.280086621958e-04, "adv_weight": 1.1511724095585e-03, "perceptual_weight": 1.442331518877e-04, "within_weight": 2.994437663118621e-01},
+    # {"batch_size": 18, "lr": 7.83484866934e-05, "adv_weight": 6.5266196100463e-03, "perceptual_weight": 3.237793725638e-03, "within_weight": 5.57862828745686e-02},
+    # ]
+
+    # if args.cfg_index is not None:
+    #     cfg = PRESETS[int(args.cfg_index)]
+    #     # Overwrite args with the preset (keeping your types correct)
+    #     args.batch_size        = int(cfg["batch_size"])
+    #     args.lr                = float(cfg["lr"])
+    #     args.adv_weight        = float(cfg["adv_weight"])
+    #     args.perceptual_weight = float(cfg["perceptual_weight"])
+    #     args.within_weight     = float(cfg["within_weight"])
+
+    # CKPTS = {
+    #     1: "/home/andim/projects/def-bedelb/andim/all-checkpoints/ae_output/fold_1/autoencoder-ep-517.pth",
+    #     2: "/home/andim/projects/def-bedelb/andim/all-checkpoints/ae_output/fold_2/autoencoder-ep-412.pth",
+    #     3: "/home/andim/projects/def-bedelb/andim/all-checkpoints/ae_output/fold_3/autoencoder-ep-446.pth",
+    #     4: "/home/andim/projects/def-bedelb/andim/all-checkpoints/ae_output/fold_4/autoencoder-ep-432.pth",
+    #     5: "/home/andim/projects/def-bedelb/andim/all-checkpoints/ae_output/fold_5/autoencoder-ep-380.pth",
+    #     }
+    # args.aekl_ckpt = CKPTS[int(args.fold_test)]
+
     run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
 
     # To cumulate difference plots and then create a gif
@@ -890,21 +1125,29 @@ if __name__ == '__main__':
     run = wandb.init(
             project=args.project,
             name=run_name,
-            mode="offline",
-            config={
-                "dataset_csv": args.dataset_csv,
-                "aekl_ckpt": args.aekl_ckpt,
-                "disc_ckpt": args.disc_ckpt,
-                "n_epochs": args.n_epochs,
-                "max_batch_size": args.max_batch_size,
-                "batch_size": args.batch_size,
-                "lr": args.lr,
-                "resolution": const.RESOLUTION,
-                "input_shape": const.INPUT_SHAPE_AE,
-                "fold_test": args.fold_test
-            }
+            # mode="offline",
+            mode="online",
+            config=vars(args),
+            group=f"fold-test-{args.fold_test}",
+            # config={
+            #     "dataset_csv": args.dataset_csv,
+            #     "aekl_ckpt": args.aekl_ckpt,
+            #     "disc_ckpt": args.disc_ckpt,
+            #     "n_epochs": args.n_epochs,
+            #     "max_batch_size": args.max_batch_size,
+            #     "batch_size": args.batch_size,
+            #     "lr": args.lr,
+            #     "resolution": const.RESOLUTION,
+            #     "input_shape": const.INPUT_SHAPE_AE,
+            #     "fold_test": args.fold_test
+            # }
         )
     config = wandb.config
+
+
+    # grouping runs by fold to keep the UI tidy
+    wandb.run.define_metric("train/*", step_metric="total_counter")
+    wandb.run.define_metric("val/*",   step_metric="epoch")
 
     # ─── Build train/val splits ────────────────────────────────────
     dataset_df = pd.read_csv(config.dataset_csv)
@@ -921,18 +1164,36 @@ if __name__ == '__main__':
     # ─── Datasets & DataLoaders ────────────────────────────────────
     train_ds = LongitudinalMRIDataset(
     df=train_df,
-    resolution=config.resolution,
-    target_shape=config.input_shape
+    resolution=const.RESOLUTION,
+    target_shape=const.INPUT_SHAPE_AE
     )
 
-    batch_sampler = SubjectTriadBatchSampler(train_ds)
+    val_ds = LongitudinalMRIDataset(
+    df=test_df,
+    resolution=const.RESOLUTION,
+    target_shape=const.INPUT_SHAPE_AE
+    )
+
+    train_sampler = SubjectTriadBatchSampler(train_ds)
+    val_sampler = SubjectTriadBatchSampler(val_ds)
 
     train_loader = DataLoader(
         dataset=train_ds,
-        batch_sampler=batch_sampler,
+        batch_sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True
     )
+
+    val_loader = DataLoader(
+        dataset=val_ds,
+        batch_sampler=val_sampler,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+
+    print(f"[debug] train={len(train_ds)}  val={len(val_ds)}  "
+      f"triads: train={len(train_sampler)} val={len(val_sampler)}")
+    assert len(val_ds) > 0, f"Fold {fold} has no validation rows."
 
 
     # ─── Load pretrained AutoencoderKL and Discriminator ────────────
@@ -949,7 +1210,9 @@ if __name__ == '__main__':
 
     # ─── Instantiate AgeConditionalDecoder ────────────────────────
     age_embed_dim = 16
-    cond_decoder = AgeConditionalDecoder(pretrained_ae=autoencoder, age_embed_dim=age_embed_dim).to(DEVICE)
+    
+    # cond_decoder = AgeConditionalDecoder(pretrained_ae=autoencoder, age_embed_dim=age_embed_dim).to(DEVICE)
+    cond_decoder = AgeConditionalDecoderFiLM(pretrained_ae=autoencoder, age_embed_dim=age_embed_dim).to(DEVICE)
 
     # Optionally unfreeze last few conv blocks if you want:  
     # for name, param in cond_decoder.decoder_body.named_parameters():  
@@ -979,46 +1242,53 @@ if __name__ == '__main__':
     # Pixel-wise reconstruction loss (|x_pred − x_true|). 
     # Drives overall anatomical fidelity and intensity accuracy.
 
-    adv_weight = 0.025
-    # Adversarial (generator) weight. Encourages realism/sharpness by fooling the discriminator.
-    # Too high → flicker/instability; too low → blurry outputs.
+    # adv_weight = 0.025
+    # # Adversarial (generator) weight. Encourages realism/sharpness by fooling the discriminator.
+    # # Too high → flicker/instability; too low → blurry outputs.
 
-    perceptual_weight = 0.001
-    # Perceptual / feature-space similarity (e.g., VGG-like or MONAI squeeze).
-    # Preserves higher-level structures and textures beyond raw pixels.
-    # Reduce if training is slow or unstable.
+    # perceptual_weight = 0.001
+    # # Perceptual / feature-space similarity (e.g., VGG-like or MONAI squeeze).
+    # # Preserves higher-level structures and textures beyond raw pixels.
+    # # Reduce if training is slow or unstable.
 
-    within_weight = 0.2
-    # within_weight_start = 0.05
-    # within_weight_end   = 0.5  
-    # ramp_epochs         = 10
-    # Within-subject latent consistency. For pairs from the same subject,
-    # pulls predicted latents closer, with stronger pull when Δage is small.
-    # Improves subject-specific temporal coherence.
+    # within_weight = 0.2
+    # # within_weight_start = 0.05
+    # # within_weight_end   = 0.5  
+    # # ramp_epochs         = 10
+    # # Within-subject latent consistency. For pairs from the same subject,
+    # # pulls predicted latents closer, with stronger pull when Δage is small.
+    # # Improves subject-specific temporal coherence.
 
-    # two_view_weight = 0.1
-    # Two-view consistency for singletons (when only one pair for a subject is in-batch).
-    # Predict from x0 and an augmented x0; make their predicted latents agree.
-    # Acts like self-consistency when no second timepoint from the same subject is present.
+    # # two_view_weight = 0.1
+    # # Two-view consistency for singletons (when only one pair for a subject is in-batch).
+    # # Predict from x0 and an augmented x0; make their predicted latents agree.
+    # # Acts like self-consistency when no second timepoint from the same subject is present.
 
-    lambda_id = 0.02   # try 0.01–0.05
-    # Age-aware small-step identity regularizer.
-    # When Δage is small (especially at older baseline ages), nudges prediction toward the baseline
-    # (typically in latent space). Weakens automatically for younger ages where small Δage can
-    # still mean noticeable anatomical change.
+    # lambda_id = 0.02   # try 0.01–0.05
+    # # Age-aware small-step identity regularizer.
+    # # When Δage is small (especially at older baseline ages), nudges prediction toward the baseline
+    # # (typically in latent space). Weakens automatically for younger ages where small Δage can
+    # # still mean noticeable anatomical change.
 
-    # Total G loss ≈ L1 (reconstruction) + adv_weight·GAN + perceptual_weight·perceptual + within_weight·within-subject + two_view_weight·two-view + lambda_id·age-aware-identity
+    # # Total G loss ≈ L1 (reconstruction) + adv_weight·GAN + perceptual_weight·perceptual + within_weight·within-subject + two_view_weight·two-view + lambda_id·age-aware-identity
+
+    adv_weight        = float(config.adv_weight)
+    perceptual_weight = float(config.perceptual_weight)
+    within_weight     = float(config.within_weight)
+    # lambda_id         = float(config.lambda_id)  
 
     loss_weights = {
-    "adv_weight": adv_weight,
-    "perceptual_weight": perceptual_weight,
-    "within_weight": within_weight,
+        "adv_weight": adv_weight,
+        "perceptual_weight": perceptual_weight,
+        "within_weight": within_weight,
     }
+    run.config.update({f"loss_weights/{k}": v for k, v in loss_weights.items()}, allow_val_change=True)
 
-    run.config.update(
-    {f"loss_weights/{k}": v for k, v in loss_weights.items()},
-    allow_val_change=True
-    )
+    if config.batch_size < config.max_batch_size:
+        print(f"Invalid combo: batch_size({config.batch_size}) < max_batch_size({config.max_batch_size})")
+        wandb.finish(exit_code=0)
+        raise SystemExit(0)
+
 
     kl_loss_fn  = KLDivergenceLoss()
     adv_loss_fn = PatchAdversarialLoss(criterion="least_squares")
@@ -1060,6 +1330,27 @@ if __name__ == '__main__':
 
     avgloss = utils.AverageLoss()
     total_counter = 0
+    best_val = None
+    best_epoch = -1
+    epochs_no_improve = 0
+
+    best_ckpt_path = os.path.join(args.output_dir, 'best.ckpt')   # single rolling “best”
+    last_ckpt_path = os.path.join(args.output_dir, 'last.ckpt')   # last epoch
+
+    # Smoothing buffers
+    val_hist = deque(maxlen=3)   # rolling median-of-3
+    val_ema  = None              # EMA(alpha=0.3)
+
+    # LR-on-plateau scheduler (on generator; add one for D if you want)
+    sched_g = ReduceLROnPlateau(
+        optimizer_g, mode='min',
+        factor=args.plateau_factor,
+        patience=args.plateau_patience,
+        cooldown=args.plateau_cooldown,
+        threshold=1e-4, threshold_mode='abs'
+    )
+    num_lr_reductions = 0
+    prev_lr = optimizer_g.param_groups[0]['lr']
 
     # ─── Training Loop ───────────────────────────────────────────
     for epoch in range(config.n_epochs):
@@ -1076,107 +1367,117 @@ if __name__ == '__main__':
             img1 = img1.to(DEVICE)
             age1 = age1.to(DEVICE).float()   # use follow-up age
             
+            try:
+                # ── Generator (“conditional decoder”) step ─────────────
+                with autocast(enabled=True):
+                    x1_pred = model(img0, age0, age1)  
 
-            # ── Generator (“conditional decoder”) step ─────────────
-            with autocast(enabled=True):
-                x1_pred = model(img0, age0, age1)  
+                    # x1_small = F.avg_pool3d(_to_plain(x1_pred), 4, 4)  # stronger pooling to shrink graph
+                    # z_pred   = encode_mu_grad_chunked(
+                    #     autoencoder, x1_small, batch_chunk=2, segs=6, use_reentrant=False, amp=True
+                    # ).view(x1_pred.size(0), -1)
+                    z_pred = enc_mu_ckpt(autoencoder, x1_pred).view(x1_pred.size(0), -1)
+                    # z_pred = enc_mu_nograd(autoencoder, x1_pred).view(x1_pred.size(0), -1)
 
-                # x1_small = F.avg_pool3d(_to_plain(x1_pred), 4, 4)  # stronger pooling to shrink graph
-                # z_pred   = encode_mu_grad_chunked(
-                #     autoencoder, x1_small, batch_chunk=2, segs=6, use_reentrant=False, amp=True
-                # ).view(x1_pred.size(0), -1)
-                z_pred = enc_mu_ckpt(autoencoder, x1_pred).view(x1_pred.size(0), -1)
+                    # Discriminator on fake → generator adv‐loss
+                    logits_fake = discriminator(x1_pred.contiguous().float())[-1]
+                    gen_adv_loss = adv_weight * adv_loss_fn(
+                        logits_fake, target_is_real=True, for_discriminator=False
+                    )
 
-                # Discriminator on fake → generator adv‐loss
-                logits_fake = discriminator(x1_pred.contiguous().float())[-1]
-                gen_adv_loss = adv_weight * adv_loss_fn(
-                    logits_fake, target_is_real=True, for_discriminator=False
-                )
+                    # Reconstruction (L1) between x1_pred and img1
+                    rec_loss = l1_loss_fn(x1_pred.float(), img1.float())
 
-                # Reconstruction (L1) between x1_pred and img1
-                rec_loss = l1_loss_fn(x1_pred.float(), img1.float())
+                    # Optional perceptual loss
+                    perc_loss = perceptual_weight * perc_loss_fn(x1_pred.float(), img1.float())
 
-                # Optional perceptual loss
-                perc_loss = perceptual_weight * perc_loss_fn(x1_pred.float(), img1.float())
+                    # We skip KLD since encoder is frozen
+                    # kld_loss = torch.tensor(0.0).to(DEVICE)
 
-                # We skip KLD since encoder is frozen
-                # kld_loss = torch.tensor(0.0).to(DEVICE)
+                    
+                    with torch.no_grad():
+                        z0     = enc_mu(autoencoder, img0).view(img0.size(0), -1)
+                        # x0_small = F.avg_pool3d(_to_plain(img0), 4, 4)
+                        # z0       = enc_mu_nograd(autoencoder, x0_small)
 
-                
-                with torch.no_grad():
-                    z0     = enc_mu(autoencoder, img0).view(img0.size(0), -1)
-                    # x0_small = F.avg_pool3d(_to_plain(img0), 4, 4)
-                    # z0       = enc_mu_nograd(autoencoder, x0_small)
+                    # flatten BOTH to [B, Dflat]
+                    # z_pred_feat = z_pred.view(z_pred.size(0), -1)
+                    # z0_feat     = z0.view(z0.size(0), -1)
 
-                # flatten BOTH to [B, Dflat]
-                # z_pred_feat = z_pred.view(z_pred.size(0), -1)
-                # z0_feat     = z0.view(z0.size(0), -1)
+                    if step == 0 and epoch == 0:
+                        # print("x1_small:", tuple(x1_small.shape))
+                        print("x1_pred:", tuple(x1_pred.shape))
+                        # print("z_pred_mu:", tuple(z_pred.shape))
+                        # print("z0_mu:", tuple(z0.shape))
+                        print("z0:", tuple(z0.shape))
+                        # print("z_pred_feat:", tuple(z_pred_feat.shape))
+                        print("z_pred:", tuple(z_pred.shape))
 
-                if step == 0 and epoch == 0:
-                    # print("x1_small:", tuple(x1_small.shape))
-                    print("x1_pred:", tuple(x1_pred.shape))
-                    # print("z_pred_mu:", tuple(z_pred.shape))
-                    # print("z0_mu:", tuple(z0.shape))
-                    print("z0:", tuple(z0.shape))
-                    # print("z_pred_feat:", tuple(z_pred_feat.shape))
-                    print("z_pred:", tuple(z_pred.shape))
+                    # batch-level within-subject loss from same subject
+                    l_within = within_subject_latent_loss(z_pred, age1.squeeze(1), subject_id, sigma=0.1)
+                    loss_g = rec_loss + gen_adv_loss + perc_loss + within_weight * l_within
+                    # l_within = within_subject_latent_loss_ageaware(z_pred_feat, age1.squeeze(1), subject_id)
+                    # within_weight = within_weight_start + (within_weight_end - within_weight_start) * min(epoch / ramp_epochs, 1.0)
+                    # loss_g = rec_loss + gen_adv_loss + perc_loss + within_weight * l_within
 
-                # batch-level within-subject loss from same subject
-                l_within = within_subject_latent_loss(z_pred, age1.squeeze(1), subject_id, sigma=0.1)
-                loss_g = rec_loss + gen_adv_loss + perc_loss + within_weight * l_within
-                # l_within = within_subject_latent_loss_ageaware(z_pred_feat, age1.squeeze(1), subject_id)
-                # within_weight = within_weight_start + (within_weight_end - within_weight_start) * min(epoch / ramp_epochs, 1.0)
-                # loss_g = rec_loss + gen_adv_loss + perc_loss + within_weight * l_within
+                    # # ages in months
+                    # age0_m = norm_to_months(age0)           # [B,1]
+                    # age1_m = norm_to_months(age1)           # [B,1]
+                    # d_m     = (age1_m - age0_m).abs()       # [B,1]  Δmonths
 
-                # # ages in months
-                # age0_m = norm_to_months(age0)           # [B,1]
-                # age1_m = norm_to_months(age1)           # [B,1]
-                # d_m     = (age1_m - age0_m).abs()       # [B,1]  Δmonths
+                    # w_id = small_step_weight_months(
+                    #     age0, age1, tau_mode="smooth",
+                    #     pivot=36.0, steep=0.12, tau_young_s=9.0, tau_old_s=3.0
+                    # )
 
-                # w_id = small_step_weight_months(
-                #     age0, age1, tau_mode="smooth",
-                #     pivot=36.0, steep=0.12, tau_young_s=9.0, tau_old_s=3.0
-                # )
+                    # # apply weight per-sample
+                    # l_id_lat_per = (z_pred_feat - z0_feat).pow(2).mean(dim=1, keepdim=True)   # [B,1]
+                    # l_id_lat     = (w_id * l_id_lat_per).mean()
 
-                # # apply weight per-sample
-                # l_id_lat_per = (z_pred_feat - z0_feat).pow(2).mean(dim=1, keepdim=True)   # [B,1]
-                # l_id_lat     = (w_id * l_id_lat_per).mean()
+                    # # ----- per-batch scalars to log -----
+                    # w_id_mean     = w_id.mean()                       # scalar
+                    # d_m_mean      = d_m.mean()                        # scalar
+                    # id_contrib    = lambda_id * l_id_lat              # scalar (regularizer's contribution)
 
-                # # ----- per-batch scalars to log -----
-                # w_id_mean     = w_id.mean()                       # scalar
-                # d_m_mean      = d_m.mean()                        # scalar
-                # id_contrib    = lambda_id * l_id_lat              # scalar (regularizer's contribution)
+                    # # age-bin masks (12–24, 24–48, 48–84 months)
+                    # b12_24 = (age0_m >= 12.0) & (age0_m < 24.0)
+                    # b24_48 = (age0_m >= 24.0) & (age0_m < 48.0)
+                    # b48_84 = (age0_m >= 48.0) & (age0_m <= 84.0)
 
-                # # age-bin masks (12–24, 24–48, 48–84 months)
-                # b12_24 = (age0_m >= 12.0) & (age0_m < 24.0)
-                # b24_48 = (age0_m >= 24.0) & (age0_m < 48.0)
-                # b48_84 = (age0_m >= 48.0) & (age0_m <= 84.0)
+                    # # mean w_id per bin (may be NaN if no samples fall in a bin for this batch)
+                    # w12_24 = masked_mean(w_id.view(-1), b12_24.view(-1))
+                    # w24_48 = masked_mean(w_id.view(-1), b24_48.view(-1))
+                    # w48_84 = masked_mean(w_id.view(-1), b48_84.view(-1))
 
-                # # mean w_id per bin (may be NaN if no samples fall in a bin for this batch)
-                # w12_24 = masked_mean(w_id.view(-1), b12_24.view(-1))
-                # w24_48 = masked_mean(w_id.view(-1), b24_48.view(-1))
-                # w48_84 = masked_mean(w_id.view(-1), b48_84.view(-1))
+                    # loss_g = loss_g + lambda_id * l_id_lat
 
-                # loss_g = loss_g + lambda_id * l_id_lat
+                # ---- free big intermediates BEFORE backward ----
+                # del x1_small, logits_fake
+                torch.cuda.empty_cache()
+                gradacc_g.step(loss_g, step)
 
-            # ---- free big intermediates BEFORE backward ----
-            # del x1_small, logits_fake
-            torch.cuda.empty_cache()
-            gradacc_g.step(loss_g, step)
+                # ── Discriminator step ─────────────────────────────────
+                with autocast(enabled=True):
+                    logits_fake_detach = discriminator(x1_pred.contiguous().detach())[-1]
+                    d_loss_fake = adv_loss_fn(
+                        logits_fake_detach, target_is_real=False, for_discriminator=True
+                    )
+                    logits_real = discriminator(img1.contiguous().detach())[-1]
+                    d_loss_real = adv_loss_fn(
+                        logits_real, target_is_real=True, for_discriminator=True
+                    )
+                    loss_d = adv_weight * 0.5 * (d_loss_fake + d_loss_real)
 
-            # ── Discriminator step ─────────────────────────────────
-            with autocast(enabled=True):
-                logits_fake_detach = discriminator(x1_pred.contiguous().detach())[-1]
-                d_loss_fake = adv_loss_fn(
-                    logits_fake_detach, target_is_real=False, for_discriminator=True
-                )
-                logits_real = discriminator(img1.contiguous().detach())[-1]
-                d_loss_real = adv_loss_fn(
-                    logits_real, target_is_real=True, for_discriminator=True
-                )
-                loss_d = adv_weight * 0.5 * (d_loss_fake + d_loss_real)
+                gradacc_d.step(loss_d, step)
 
-            gradacc_d.step(loss_d, step)
+            except RuntimeError as e:
+                if int(os.environ.get("OOM_SKIP", "0")) and _oom_guard(e):
+                    # mark and skip this run/combination cleanly
+                    wandb.log({"status/oom": 1})
+                    print("[warn] OOM encountered; marking run as skipped.")
+                    wandb.finish(exit_code=0)
+                    raise SystemExit(0)
+                raise 
 
             # ── Logging to W&B ────────────────────────────────────
             avgloss.put('Generator/rec_loss', rec_loss.item())
@@ -1231,26 +1532,26 @@ if __name__ == '__main__':
             #     }, step=it)
 
             if total_counter % 10 == 0:
-                it = total_counter #// 10
+                # it = total_counter #// 10
                 # Log average losses every 10 iters
                 metrics = {
-                    'train/gen/rec_loss': avgloss.pop_avg('Generator/rec_loss'),
-                    'train/gen/adv_loss': avgloss.pop_avg('Generator/adv_loss'),
-                    'train/gen/perc_loss': avgloss.pop_avg('Generator/perc_loss'),
-                    'train/gen/within':    avgloss.pop_avg('Generator/within'),
+                    'train/Generator/rec_loss': avgloss.pop_avg('Generator/rec_loss'),
+                    'train/Generator/adv_loss': avgloss.pop_avg('Generator/adv_loss'),
+                    'train/Generator/perc_loss': avgloss.pop_avg('Generator/perc_loss'),
+                    'train/Generator/within':    avgloss.pop_avg('Generator/within'),
                     # 'train/gen/two_view':  avgloss.pop_avg('Generator/two_view'),
-                    'train/gen/total':     avgloss.pop_avg('Generator/total'),
-                    'train/disc/loss': avgloss.pop_avg('Discriminator/loss'),
+                    'train/Generator/total':     avgloss.pop_avg('Generator/total'),
+                    'train/Discriminator/loss': avgloss.pop_avg('Discriminator/loss'),
                     # 'train/regid/w_id_mean':    avgloss.pop_avg('RegID/w_id_mean'),
                     # 'train/regid/w_id_12_24':   avgloss.pop_avg('RegID/w_id_12_24'),
                     # 'train/regid/w_id_24_48':   avgloss.pop_avg('RegID/w_id_24_48'),
                     # 'train/regid/w_id_48_84':   avgloss.pop_avg('RegID/w_id_48_84'),
                     # 'train/regid/dmonths_mean': avgloss.pop_avg('RegID/dmonths_mean'),
                     # 'train/regid/id_contrib':   avgloss.pop_avg('RegID/id_contrib'),
-                    'step': it,
+                    'total_counter': total_counter,
                     'epoch': epoch
                 }
-                wandb.log(metrics, step=it)
+                wandb.log(metrics, step=total_counter)
 
                 # 2) Prepare volumes for 3×3 grid (take first element of batch, index 0)
                 baseline_vol = img0[0, 0].detach().cpu().numpy()[None, ...]   # [1,D,H,W]
@@ -1279,7 +1580,7 @@ if __name__ == '__main__':
                     recon_vol,
                     true_vol,
                     pred_vol,
-                    step=it,
+                    step=total_counter,
                     tag="Train/Recon_Pred"
                 )
 
@@ -1377,6 +1678,65 @@ if __name__ == '__main__':
 
         
         print(f"Epoch {epoch} ▶︎ Train L1 = {avgloss.get_avg('Generator/rec_loss'):.4f}")
+
+        val_means = evaluate_one_epoch(
+        model, discriminator, val_loader, DEVICE,
+        l1_loss_fn, perc_loss_fn, adv_loss_fn,
+        adv_weight=adv_weight, within_weight=within_weight
+        )
+        val_total = float(val_means["total"])
+        val_rec   = float(val_means["rec"])
+        wandb.log({
+            "val/Generator/rec_loss":   val_rec,
+            "val/Generator/adv_loss":   val_means["adv"],
+            "val/Generator/perc_loss":  val_means["perc"],
+            "val/Generator/within":     val_means["within"],
+            "val/Generator/total":      val_total,
+            "val/Discriminator/loss":   val_means["d"],
+            "epoch":                    epoch
+        })
+        # Keep a clean "best so far" in the summary (useful for sweeps)
+        wandb.run.summary["val/Generator/total"] = val_total
+        print(f"Epoch {epoch} ▶︎ Val total = {val_total:.4f}  |  Val L1 = {val_rec:.4f}")
+
+        _save_ckpt(
+        last_ckpt_path, cond_decoder, discriminator,
+        extra={"epoch": epoch, "val_total": float(val_means["total"])}
+        )
+
+        # Save BEST checkpoint if improved
+        if _is_better(val_total, best_val, delta_abs=args.early_stop_delta):
+            best_val = val_total
+            best_epoch = int(epoch)
+            epochs_no_improve = 0
+            _save_ckpt(best_ckpt_path, cond_decoder, discriminator,
+                    extra={"epoch": best_epoch, "val_total": best_val})
+            wandb.log({"status/new_best": 1,
+                    "status/best_epoch": best_epoch,
+                    "status/best_val_total": best_val}, step=epoch)
+        else:
+            epochs_no_improve += 1
+            wandb.log({"status/new_best": 0,
+                    "status/epochs_no_improve": epochs_no_improve}, step=epoch)
+
+        # Early stopping condition
+        if (epoch + 1) >= args.min_epochs and epochs_no_improve >= args.early_stop_patience:
+            print(f"[early-stop] No improvement for {epochs_no_improve} epochs "
+                f"(best={best_val:.6f} @ epoch {best_epoch}). Stopping.")
+            break
+
+    summary_path = os.path.join(args.output_dir, "best_summary.json")
+    summary = {
+        "run_id": wandb.run.id if wandb.run else None,
+        "fold": int(args.fold_test),
+        "best_epoch": best_epoch,
+        "best_val_total": best_val,
+        "best_ckpt_path": best_ckpt_path,
+        "n_epochs_run": epoch + 1
+    }
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[summary] wrote {summary_path}")
 
     # read back all frames in order
     # frames = [Image.open(f) for f in diff_frames]

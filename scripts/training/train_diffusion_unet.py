@@ -171,10 +171,16 @@ if __name__ == '__main__':
     parser.add_argument('--num_inf_steps', type=int, default=50, help="Number of inference steps for DDIM sampler at inference time")
     args = parser.parse_args()
 
+    # wandb.init(
+    # project="ldm-age-prediction",
+    # config=vars(args),      # logs all CLI args as hyperparameters
+    # mode="offline",         # records locally; you can later `wandb sync`
+    # dir=args.output_dir     # where to write the wandb files
+    # )
     wandb.init(
-    project="ldm-age-prediction",
+    project="diffusion-model",
     config=vars(args),      # logs all CLI args as hyperparameters
-    mode="offline",         # records locally; you can later `wandb sync`
+    mode="online",         # records locally; you can later `wandb sync`
     dir=args.output_dir     # where to write the wandb files
     )
     
