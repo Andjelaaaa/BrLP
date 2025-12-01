@@ -211,7 +211,7 @@ if __name__ == '__main__':
     if fold not in range(1,6):
         raise ValueError(f"fold must be 1..5, got {fold}")
 
-    print(f"\n\n=== Training on fold {fold}")
+    print(f"\n\n=== Training on fold {fold} ===")
 
     dataset_df = pd.read_csv(args.dataset_csv)
     
